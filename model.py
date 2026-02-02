@@ -136,15 +136,14 @@ class RegionalAdapterWhisper(nn.Module):
 
             # Forward through decoder
             if labels is not None:
-                # Training mode - use labels
+                # Training mode - use labels (Whisper will create decoder_input_ids)
                 decoder_outputs = self.whisper(
                     encoder_outputs=(adapted_encoder_outputs,),
-                    decoder_input_ids=decoder_input_ids,
                     labels=labels,
                     return_dict=True
                 )
             else:
-                # Inference mode - just decoder_input_ids
+                # Inference mode - use decoder_input_ids
                 decoder_outputs = self.whisper(
                     encoder_outputs=(adapted_encoder_outputs,),
                     decoder_input_ids=decoder_input_ids,

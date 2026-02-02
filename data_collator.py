@@ -54,18 +54,8 @@ class DataCollatorSpeechSeq2SeqWithPadding:
             labels_batch.attention_mask.ne(1), -100
         )
 
-        # Create decoder_input_ids
-        decoder_input_ids = torch.cat(
-            [
-                torch.ones((labels.shape[0], 1), dtype=torch.long) *
-                self.decoder_start_token_id,
-                labels[:, :-1]
-            ],
-            dim=-1
-        )
-
         batch["labels"] = labels
-        batch["decoder_input_ids"] = decoder_input_ids
+        # Don't manually create decoder_input_ids - let Whisper handle it from labels
 
         return batch
 
