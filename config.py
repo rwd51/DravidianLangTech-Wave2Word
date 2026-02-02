@@ -32,10 +32,10 @@ TASK = "transcribe"
 # =============================================================================
 SEED = 42
 SAMPLING_RATE = 16000
-MAX_LENGTH = 225
+MAX_LENGTH = 256
 
 # Training settings
-BATCH_SIZE = 64
+BATCH_SIZE = 32
 GRADIENT_ACCUMULATION_STEPS = 16
 EFFECTIVE_BATCH_SIZE = BATCH_SIZE * GRADIENT_ACCUMULATION_STEPS
 
