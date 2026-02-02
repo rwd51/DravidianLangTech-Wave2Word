@@ -202,13 +202,13 @@ def main():
         weight_decay=WEIGHT_DECAY,
         warmup_steps=WARMUP_STEPS,
 
-        save_total_limit=1,  # Keep only best checkpoint
+        save_total_limit=1,  # Keep only 1 checkpoint at a time
         fp16=FP16 and torch.cuda.is_available(),
         predict_with_generate=True,
 
         load_best_model_at_end=True,
         metric_for_best_model="wer",
-        greater_is_better=False,
+        greater_is_better=False,  # Lower WER is better
 
         gradient_checkpointing=False,
         generation_max_length=MAX_LENGTH,
@@ -307,6 +307,17 @@ def main():
         json.dump(dialect_mapping, f, indent=2)
 
     print(f"\nModel and training artifacts saved to: {OUTPUT_DIR}")
+
+    # =========================================================================
+    # Cleanup intermediate checkpoints (keep only final model)
+    # =========================================================================
+    import shutil
+    checkpoint_dirs = [d for d in os.listdir(OUTPUT_DIR) if d.startswith("checkpoint-")]
+    for ckpt_dir in checkpoint_dirs:
+        ckpt_path = os.path.join(OUTPUT_DIR, ckpt_dir)
+        if os.path.isdir(ckpt_path):
+            shutil.rmtree(ckpt_path)
+            print(f"Removed intermediate checkpoint: {ckpt_dir}")
 
     # =========================================================================
     # Final Evaluation
