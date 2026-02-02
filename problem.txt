@@ -1,0 +1,38 @@
+DravidianLangTech @ ACL 2026
+Tamil is spoken across diverse regions with rich sociolinguistic and dialectal variations. These variations introduce substantial challenges for speech technologies such as Automatic Speech Recognition (ASR) and dialect identification. This shared task aims to address these challenges by providing a curated dialectal speech corpus and evaluation framework to advance research in robust Tamil speech processing.
+
+Task Overview
+The Tamil Dialect Speech Dataset has been developed to capture linguistic differences across major dialect regions of Tamil Nadu. The dataset consists of both spontaneous and read speech produced by native speakers representing four dialect groups:
+
+Northern dialect
+Southern dialect
+Western dialect
+Central dialect
+Speakers include both male and female participants across various age groups. All recordings were captured in natural acoustic environments at 16 kHz sampling rate, ensuring realistic background conditions that help in building deployable, noise-robust models.
+
+A total of 9.22 hours of manually transcribed speech is provided as the training set, and 2.05 hours of audio is released as the test set for evaluation.
+
+This shared task is organized around two subtasks focusing on dialect identification and ASR.
+
+Subtask 1: Speech-Based Dialect Classification
+
+Objective
+
+Predict the dialect category of a given audio file. Participants must classify each audio sample into one of the four dialect classes:
+
+Northern dialect
+Southern dialect
+Western dialect
+Central dialect
+Description
+
+This subtask encourages the development of robust acoustic and linguistic models capable of capturing subtle phonetic, prosodic, and lexical differences across Tamil dialects. Systems may use classical machine learning, deep learning, or self-supervised speech representation techniques.
+
+Subtask 2: Automatic Speech Recognition (ASR) for Dialectal Tamil
+Objective
+
+Transcribe the given dialectal speech signal into Tamil text.
+
+Description
+
+Participants must build ASR models that can handle intra-language variability arising from dialectal shifts. Spontaneous conversational patterns, prosodic changes, code-mixed influence, and region-specific vocabulary make this task challenging and practically relevant for real-world Tamil ASR applications.

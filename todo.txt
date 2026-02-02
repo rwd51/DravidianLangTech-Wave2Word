@@ -1,0 +1,10 @@
+1. see my Dejaview_Whisper_Classifier_Training.ipynb codes
+this code was used for bangla in a competition, wanna use this architecture now
+
+
+2. see my new problem.txt
+
+3. see my data structure here at struct.txt
+
+4. replicate my architecture for this tamil problem using vasista22/whisper-tamil-medium, do standard text cleaning normalization for tamil folllowing the internet. dont do any denoising step , and keep my core architecture as it is for now no text preprocessing
+while preparing the code prepare codes in .py files if possible keep it modular if possible , also do train val split , I will take inference on val later to analyze my model so keep val reproducable, 
