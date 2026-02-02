@@ -125,7 +125,10 @@ class RegionalTrainer(Seq2SeqTrainer):
         if tensor.shape[-1] >= max_length:
             return tensor
 
-        pad_token_id = self.tokenizer.pad_token_id
+        # Use model's pad_token_id or default to eos_token_id
+        pad_token_id = self.regional_model.whisper.config.pad_token_id
+        if pad_token_id is None:
+            pad_token_id = self.regional_model.whisper.config.eos_token_id
         if pad_token_id is None:
             pad_token_id = 0
 
