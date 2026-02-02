@@ -54,6 +54,11 @@ class DataCollatorSpeechSeq2SeqWithPadding:
             labels_batch.attention_mask.ne(1), -100
         )
 
+        # Truncate labels to Whisper's max decoder length (448 tokens)
+        MAX_LABEL_LENGTH = 448
+        if labels.shape[1] > MAX_LABEL_LENGTH:
+            labels = labels[:, :MAX_LABEL_LENGTH]
+
         batch["labels"] = labels
         # Don't manually create decoder_input_ids - let Whisper handle it from labels
 
