@@ -5,6 +5,7 @@ import os
 import gc
 import json
 import random
+import shutil
 import numpy as np
 import torch
 import evaluate
@@ -14,7 +15,8 @@ from transformers import (
     WhisperFeatureExtractor,
     WhisperTokenizer,
     WhisperForConditionalGeneration,
-    Seq2SeqTrainingArguments
+    Seq2SeqTrainingArguments,
+    TrainerCallback
 )
 
 from config import (
@@ -51,6 +53,54 @@ from dataset import TamilDialectDataset
 from model import RegionalAdapterWhisper
 from data_collator import DataCollatorRegionalASR
 from trainer import RegionalTrainer, compute_metrics_factory
+
+
+def cleanup_checkpoints(output_dir):
+    """Remove ALL checkpoint-* directories from output_dir."""
+    if not os.path.exists(output_dir):
+        return 0
+    removed = 0
+    for item in os.listdir(output_dir):
+        if item.startswith("checkpoint-"):
+            item_path = os.path.join(output_dir, item)
+            if os.path.isdir(item_path):
+                shutil.rmtree(item_path)
+                print(f"Removed checkpoint: {item}")
+                removed += 1
+    return removed
+
+
+class SaveBestModelCallback(TrainerCallback):
+    """
+    Callback that saves ONLY the best model (lowest WER).
+    Overwrites previous best - ensures only 1 model exists at any time.
+    Also removes any checkpoint-* directories after each evaluation.
+    """
+    def __init__(self, output_dir, regional_model):
+        self.output_dir = output_dir
+        self.regional_model = regional_model
+        self.best_wer = float('inf')
+
+    def on_evaluate(self, args, state, control, metrics, **kwargs):
+        current_wer = metrics.get('eval_wer', float('inf'))
+
+        if current_wer < self.best_wer:
+            self.best_wer = current_wer
+            print(f"\n*** New best WER: {current_wer:.2f}% - Saving model ***")
+
+            # Save the regional model (overwrites previous)
+            self.regional_model.save_pretrained(
+                os.path.join(self.output_dir, "regional_adapter")
+            )
+        else:
+            print(f"\n*** WER {current_wer:.2f}% did not improve from {self.best_wer:.2f}% ***")
+
+        # ALWAYS clean up any checkpoint-* directories after evaluation
+        cleanup_checkpoints(self.output_dir)
+
+    def on_save(self, args, state, control, **kwargs):
+        """Called when trainer tries to save - immediately clean up."""
+        cleanup_checkpoints(self.output_dir)
 
 
 def set_seed(seed: int):
@@ -138,6 +188,12 @@ def main():
     # Save validation split info for reproducibility
     val_split_path = os.path.join(OUTPUT_DIR, "val_split.json")
     os.makedirs(OUTPUT_DIR, exist_ok=True)
+
+    # Clean up any leftover checkpoints from previous runs
+    removed = cleanup_checkpoints(OUTPUT_DIR)
+    if removed > 0:
+        print(f"Cleaned up {removed} leftover checkpoint(s) from previous run")
+
     save_val_split_info(val_audio, val_trans, val_dialects, val_split_path)
 
     # Create datasets
@@ -193,7 +249,7 @@ def main():
 
         # Evaluation strategy
         eval_strategy="epoch",
-        save_strategy="epoch",
+        save_strategy="no",  # NO checkpoints during training - only final model
 
         logging_steps=LOGGING_STEPS,
 
@@ -202,13 +258,8 @@ def main():
         weight_decay=WEIGHT_DECAY,
         warmup_steps=WARMUP_STEPS,
 
-        save_total_limit=1,  # Keep only 1 checkpoint at a time
         fp16=FP16 and torch.cuda.is_available(),
         predict_with_generate=True,
-
-        load_best_model_at_end=True,
-        metric_for_best_model="wer",
-        greater_is_better=False,  # Lower WER is better
 
         gradient_checkpointing=False,
         generation_max_length=MAX_LENGTH,
@@ -248,6 +299,9 @@ def main():
     print("Initializing Trainer")
     print("=" * 80)
 
+    # Create callback to save only best model
+    best_model_callback = SaveBestModelCallback(OUTPUT_DIR, regional_model)
+
     trainer = RegionalTrainer(
         regional_model=regional_model,
         model=regional_model,
@@ -257,6 +311,7 @@ def main():
         processing_class=processor,
         data_collator=data_collator,
         compute_metrics=compute_metrics,
+        callbacks=[best_model_callback],
     )
 
     print("Regional trainer initialized")
@@ -279,18 +334,18 @@ def main():
     train_result = trainer.train()
 
     # =========================================================================
-    # Save Final Model
+    # Save Training Artifacts (Best model already saved by callback)
     # =========================================================================
     print("\n" + "=" * 80)
-    print("Saving Model")
+    print("Saving Training Artifacts")
     print("=" * 80)
 
-    # Save the trainer state
-    trainer.save_model(OUTPUT_DIR)
+    # Save trainer state (for potential resume)
     trainer.save_state()
 
-    # Save regional model separately
-    regional_model.save_pretrained(os.path.join(OUTPUT_DIR, "regional_adapter"))
+    # NOTE: Best regional model already saved by SaveBestModelCallback
+    # DO NOT save regional_model here as it would overwrite the best model with the last model
+    print(f"Best model (WER: {best_model_callback.best_wer:.2f}%) saved at: {os.path.join(OUTPUT_DIR, 'regional_adapter')}")
 
     # Save training metrics
     metrics = train_result.metrics
@@ -306,18 +361,12 @@ def main():
     with open(os.path.join(OUTPUT_DIR, "dialect_mapping.json"), 'w') as f:
         json.dump(dialect_mapping, f, indent=2)
 
-    print(f"\nModel and training artifacts saved to: {OUTPUT_DIR}")
+    print(f"\nTraining artifacts saved to: {OUTPUT_DIR}")
 
     # =========================================================================
-    # Cleanup intermediate checkpoints (keep only final model)
+    # Cleanup any checkpoints (use shared function)
     # =========================================================================
-    import shutil
-    checkpoint_dirs = [d for d in os.listdir(OUTPUT_DIR) if d.startswith("checkpoint-")]
-    for ckpt_dir in checkpoint_dirs:
-        ckpt_path = os.path.join(OUTPUT_DIR, ckpt_dir)
-        if os.path.isdir(ckpt_path):
-            shutil.rmtree(ckpt_path)
-            print(f"Removed intermediate checkpoint: {ckpt_dir}")
+    cleanup_checkpoints(OUTPUT_DIR)
 
     # =========================================================================
     # Final Evaluation
@@ -330,10 +379,15 @@ def main():
     trainer.log_metrics("eval", eval_results)
     trainer.save_metrics("eval", eval_results)
 
-    print(f"\nFinal validation WER: {eval_results.get('eval_wer', 'N/A'):.2f}%")
+    # Final cleanup after evaluation (in case it triggered any saves)
+    cleanup_checkpoints(OUTPUT_DIR)
+
+    print(f"\nFinal validation WER (last model): {eval_results.get('eval_wer', 'N/A'):.2f}%")
+    print(f"Best validation WER (saved model): {best_model_callback.best_wer:.2f}%")
 
     print("\n" + "=" * 80)
     print("Training Complete!")
+    print(f"Best model saved at: {os.path.join(OUTPUT_DIR, 'regional_adapter')}")
     print("=" * 80)
 
 
