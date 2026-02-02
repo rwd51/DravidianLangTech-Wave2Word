@@ -218,6 +218,9 @@ def main():
 
         # Remove unused columns (we handle this in trainer)
         remove_unused_columns=False,
+
+        # Use pytorch format instead of safetensors (Whisper has tied weights)
+        save_safetensors=False,
     )
 
     print(f"Training batch size: {BATCH_SIZE}")
