@@ -202,7 +202,7 @@ def main():
         weight_decay=WEIGHT_DECAY,
         warmup_steps=WARMUP_STEPS,
 
-        save_total_limit=2,  # Keep best 2 checkpoints
+        save_total_limit=1,  # Keep only best checkpoint
         fp16=FP16 and torch.cuda.is_available(),
         predict_with_generate=True,
 
