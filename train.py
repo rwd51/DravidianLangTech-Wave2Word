@@ -72,28 +72,47 @@ def cleanup_checkpoints(output_dir):
 
 class SaveBestModelCallback(TrainerCallback):
     """
-    Callback that saves ONLY the best model (lowest WER).
+    Callback that saves ONLY the best model based on COMBINED score.
+    Combined Score = (100 - WER) * 0.5 + Dialect_Accuracy * 0.5
+    Higher is better. Considers BOTH tasks equally.
     Overwrites previous best - ensures only 1 model exists at any time.
     Also removes any checkpoint-* directories after each evaluation.
     """
     def __init__(self, output_dir, regional_model):
         self.output_dir = output_dir
         self.regional_model = regional_model
+        self.best_score = float('-inf')
         self.best_wer = float('inf')
+        self.best_dialect_acc = 0.0
+
+    def _compute_combined_score(self, wer, dialect_acc):
+        """
+        Combined score: weighs both ASR and Classification equally.
+        Score = (100 - WER) * 0.5 + Dialect_Accuracy * 0.5
+        """
+        asr_score = 100 - wer  # Lower WER = higher score
+        return asr_score * 0.5 + dialect_acc * 0.5
 
     def on_evaluate(self, args, state, control, metrics, **kwargs):
         current_wer = metrics.get('eval_wer', float('inf'))
+        dialect_acc = metrics.get('eval_dialect_accuracy', 0.0)
+        current_score = self._compute_combined_score(current_wer, dialect_acc)
 
-        if current_wer < self.best_wer:
+        if current_score > self.best_score:
+            self.best_score = current_score
             self.best_wer = current_wer
-            print(f"\n*** New best WER: {current_wer:.2f}% - Saving model ***")
+            self.best_dialect_acc = dialect_acc
+            print(f"\n*** New best combined score: {current_score:.2f} ***")
+            print(f"    WER: {current_wer:.2f}%, Dialect Acc: {dialect_acc:.2f}%")
+            print(f"    Saving model...")
 
             # Save the regional model (overwrites previous)
             self.regional_model.save_pretrained(
                 os.path.join(self.output_dir, "regional_adapter")
             )
         else:
-            print(f"\n*** WER {current_wer:.2f}% did not improve from {self.best_wer:.2f}% ***")
+            print(f"\n*** Score {current_score:.2f} (WER: {current_wer:.2f}%, Dialect Acc: {dialect_acc:.2f}%) ***")
+            print(f"    Did not improve from best score {self.best_score:.2f}")
 
         # ALWAYS clean up any checkpoint-* directories after evaluation
         cleanup_checkpoints(self.output_dir)
@@ -382,8 +401,18 @@ def main():
     # Final cleanup after evaluation (in case it triggered any saves)
     cleanup_checkpoints(OUTPUT_DIR)
 
-    print(f"\nFinal validation WER (last model): {eval_results.get('eval_wer', 'N/A'):.2f}%")
-    print(f"Best validation WER (saved model): {best_model_callback.best_wer:.2f}%")
+    final_wer = eval_results.get('eval_wer', 0)
+    final_dialect_acc = eval_results.get('eval_dialect_accuracy', 0)
+    final_score = (100 - final_wer) * 0.5 + final_dialect_acc * 0.5
+
+    print(f"\nFinal validation (last model):")
+    print(f"  - WER: {final_wer:.2f}%")
+    print(f"  - Dialect Accuracy: {final_dialect_acc:.2f}%")
+    print(f"  - Combined Score: {final_score:.2f}")
+    print(f"\nBest validation (saved model):")
+    print(f"  - WER: {best_model_callback.best_wer:.2f}%")
+    print(f"  - Dialect Accuracy: {best_model_callback.best_dialect_acc:.2f}%")
+    print(f"  - Combined Score: {best_model_callback.best_score:.2f}")
 
     print("\n" + "=" * 80)
     print("Training Complete!")

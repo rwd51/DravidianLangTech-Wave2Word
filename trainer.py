@@ -3,6 +3,7 @@ Custom Trainer class for Tamil Dialect Classification with Regional Adapter
 """
 import torch
 import torch.nn as nn
+import numpy as np
 from transformers import Seq2SeqTrainer
 
 from config import ALPHA_REGION_LOSS
@@ -140,6 +141,54 @@ class RegionalTrainer(Seq2SeqTrainer):
         )
         padded[:, :tensor.shape[-1]] = tensor
         return padded
+
+    def evaluate(self, eval_dataset=None, ignore_keys=None, metric_key_prefix="eval"):
+        """
+        Override evaluate to also compute dialect classification accuracy.
+        """
+        # First, run the standard evaluation (WER)
+        metrics = super().evaluate(
+            eval_dataset=eval_dataset,
+            ignore_keys=ignore_keys,
+            metric_key_prefix=metric_key_prefix
+        )
+
+        # Now compute classification accuracy on eval dataset
+        eval_dataset = eval_dataset if eval_dataset is not None else self.eval_dataset
+        if eval_dataset is None:
+            return metrics
+
+        self.regional_model.eval()
+        all_preds = []
+        all_labels = []
+
+        eval_dataloader = self.get_eval_dataloader(eval_dataset)
+
+        with torch.no_grad():
+            for batch in eval_dataloader:
+                batch = self._prepare_inputs(batch)
+
+                # Forward pass to get classification logits
+                outputs = self.regional_model(
+                    input_features=batch["input_features"],
+                    region_idx=batch.get("region_idx"),
+                    labels=batch.get("labels")
+                )
+
+                if outputs["region_logits"] is not None and "region_labels" in batch:
+                    preds = torch.argmax(outputs["region_logits"], dim=-1)
+                    all_preds.extend(preds.cpu().numpy())
+                    all_labels.extend(batch["region_labels"].cpu().numpy())
+
+        # Compute classification accuracy
+        if len(all_preds) > 0:
+            all_preds = np.array(all_preds)
+            all_labels = np.array(all_labels)
+            accuracy = (all_preds == all_labels).mean() * 100
+            metrics[f"{metric_key_prefix}_dialect_accuracy"] = accuracy
+            print(f"\n  Dialect Classification Accuracy: {accuracy:.2f}%")
+
+        return metrics
 
 
 def compute_metrics_factory(processor, metric):
