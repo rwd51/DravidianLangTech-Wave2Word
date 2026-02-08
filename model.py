@@ -103,7 +103,13 @@ class RegionalAdapterWhisper(nn.Module):
         encoder_outputs = self.whisper.model.encoder(input_features=input_features)
         hidden_states = encoder_outputs.last_hidden_state
 
+        # Regional classification - ALWAYS compute from raw encoder outputs
+        # This is needed for both training (auxiliary loss) and inference (prediction)
+        pooled_output = hidden_states.mean(dim=1)
+        region_logits = self.region_classifier(pooled_output)
+
         # Add regional information to encoder outputs (simple addition)
+        # Only during training when we have ground truth region_idx
         if region_emb is not None:
             # Expand region embedding to match sequence length and add
             region_emb_expanded = region_emb.unsqueeze(1).expand(
@@ -112,13 +118,6 @@ class RegionalAdapterWhisper(nn.Module):
             adapted_hidden_states = hidden_states + region_emb_expanded
         else:
             adapted_hidden_states = hidden_states
-
-        # Regional classification (auxiliary task)
-        region_logits = None
-        if region_idx is not None:
-            # Use mean pooled representation for classification
-            pooled_output = adapted_hidden_states.mean(dim=1)
-            region_logits = self.region_classifier(pooled_output)
 
         # Continue with decoder if needed
         decoder_outputs = None
