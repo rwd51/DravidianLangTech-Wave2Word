@@ -70,6 +70,22 @@ def cleanup_checkpoints(output_dir):
     return removed
 
 
+class EpochUpdateCallback(TrainerCallback):
+    """
+    Callback to update dataset epoch for curriculum-based augmentation.
+    Augmentation intensity increases as training progresses.
+    """
+    def __init__(self, train_dataset):
+        self.train_dataset = train_dataset
+
+    def on_epoch_begin(self, args, state, control, **kwargs):
+        """Update dataset epoch at the start of each epoch."""
+        epoch = int(state.epoch) if state.epoch else 0
+        self.train_dataset.set_epoch(epoch)
+        intensity = self.train_dataset.get_augmentation_intensity()
+        print(f"\n[Curriculum] Epoch {epoch}: Augmentation intensity = {intensity:.2f}")
+
+
 class SaveBestModelCallback(TrainerCallback):
     """
     Callback that saves ONLY the best model based on COMBINED score.
@@ -239,6 +255,18 @@ def main():
     print(f"Train dataset: {len(train_dataset)} samples (augmentation: {AUGMENT_TRAIN})")
     print(f"Validation dataset: {len(val_dataset)} samples (augmentation: {AUGMENT_VAL})")
 
+    # Compute class counts for weighted loss (order: Northern, Southern, Western, Central)
+    from collections import Counter
+    dialect_counts = Counter(train_dialects)
+    class_counts = [
+        dialect_counts.get("Northern_Dialect", 0),
+        dialect_counts.get("Southern_Dialect", 0),
+        dialect_counts.get("Western_Dialect", 0),
+        dialect_counts.get("Central_Dialect", 0)
+    ]
+    print(f"\nClass distribution (train): {dict(dialect_counts)}")
+    print(f"Class counts for weighting: {class_counts}")
+
     # =========================================================================
     # Create Data Collator
     # =========================================================================
@@ -318,11 +346,13 @@ def main():
     print("Initializing Trainer")
     print("=" * 80)
 
-    # Create callback to save only best model
+    # Create callbacks
     best_model_callback = SaveBestModelCallback(OUTPUT_DIR, regional_model)
+    epoch_callback = EpochUpdateCallback(train_dataset)  # For curriculum augmentation
 
     trainer = RegionalTrainer(
         regional_model=regional_model,
+        class_counts=class_counts,  # For weighted classification loss
         model=regional_model,
         args=training_args,
         train_dataset=train_dataset,
@@ -330,7 +360,7 @@ def main():
         processing_class=processor,
         data_collator=data_collator,
         compute_metrics=compute_metrics,
-        callbacks=[best_model_callback],
+        callbacks=[best_model_callback, epoch_callback],
     )
 
     print("Regional trainer initialized")

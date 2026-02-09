@@ -3,6 +3,7 @@ Model classes for Tamil Dialect Classification using Whisper with Regional Adapt
 """
 import torch
 import torch.nn as nn
+import torch.nn.functional as F
 from transformers.modeling_outputs import BaseModelOutput
 
 from config import ADAPTER_DIM, NUM_REGIONS
@@ -47,23 +48,34 @@ class RegionalAdapterWhisper(nn.Module):
             adapter_dim, original_whisper.config.d_model
         )
 
-        # Small classification head for auxiliary dialect classification task
-        self.region_classifier = nn.Linear(
-            original_whisper.config.d_model, num_regions
+        # Attention pooling for dialect classification
+        # Learns which parts of the audio are most important for dialect
+        d_model = original_whisper.config.d_model
+        self.attention_pool = nn.Sequential(
+            nn.Linear(d_model, d_model // 4),
+            nn.Tanh(),
+            nn.Linear(d_model // 4, 1)
         )
 
+        # Classification head with dropout for regularization
+        self.classifier_dropout = nn.Dropout(0.1)
+        self.region_classifier = nn.Linear(d_model, num_regions)
+
         # Layer norm for stability
-        self.layer_norm = nn.LayerNorm(original_whisper.config.d_model)
+        self.layer_norm = nn.LayerNorm(d_model)
 
         # Print model info
         num_adapter_params = (
-            (adapter_dim * num_regions) +
-            (adapter_dim * original_whisper.config.d_model) +
-            (original_whisper.config.d_model * num_regions)
+            (adapter_dim * num_regions) +  # region_embedding
+            (adapter_dim * d_model) +  # adapter_projection
+            (d_model * (d_model // 4) + d_model // 4) +  # attention_pool layer 1
+            (d_model // 4 * 1 + 1) +  # attention_pool layer 2
+            (d_model * num_regions)  # region_classifier
         )
         print(f"Regional Adapter initialized:")
         print(f"  - Number of regions: {num_regions}")
         print(f"  - Adapter dimension: {adapter_dim}")
+        print(f"  - Attention pooling: enabled")
         print(f"  - Additional parameters: ~{num_adapter_params:,}")
 
     def forward(
@@ -103,9 +115,13 @@ class RegionalAdapterWhisper(nn.Module):
         encoder_outputs = self.whisper.model.encoder(input_features=input_features)
         hidden_states = encoder_outputs.last_hidden_state
 
-        # Regional classification - ALWAYS compute from raw encoder outputs
-        # This is needed for both training (auxiliary loss) and inference (prediction)
-        pooled_output = hidden_states.mean(dim=1)
+        # Regional classification with ATTENTION POOLING
+        # Learns which parts of the audio are most important for dialect classification
+        # hidden_states: [batch, seq_len, d_model]
+        attn_scores = self.attention_pool(hidden_states)  # [batch, seq_len, 1]
+        attn_weights = F.softmax(attn_scores, dim=1)  # Normalize over sequence
+        pooled_output = (attn_weights * hidden_states).sum(dim=1)  # [batch, d_model]
+        pooled_output = self.classifier_dropout(pooled_output)
         region_logits = self.region_classifier(pooled_output)
 
         # Add regional information to encoder outputs (simple addition)

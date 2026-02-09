@@ -9,25 +9,53 @@ from transformers import Seq2SeqTrainer
 from config import ALPHA_REGION_LOSS
 
 
+def compute_class_weights(class_counts, device, smoothing=0.1):
+    """
+    Compute inverse frequency class weights with smoothing.
+
+    Args:
+        class_counts: List of sample counts per class [N, S, W, C]
+        device: torch device
+        smoothing: Smoothing factor to prevent extreme weights
+
+    Returns:
+        Normalized class weights tensor
+    """
+    total = sum(class_counts)
+    # Inverse frequency: classes with fewer samples get higher weight
+    weights = [total / (len(class_counts) * count) for count in class_counts]
+    # Apply smoothing: weight = (1-s) * computed_weight + s * 1.0
+    weights = [(1 - smoothing) * w + smoothing for w in weights]
+    # Normalize so mean weight = 1
+    mean_weight = sum(weights) / len(weights)
+    weights = [w / mean_weight for w in weights]
+    return torch.tensor(weights, dtype=torch.float32, device=device)
+
+
 class RegionalTrainer(Seq2SeqTrainer):
     """
     Custom trainer that handles regional/dialect classification as auxiliary task.
     Combines ASR loss with dialect classification loss.
+    Uses class weighting to handle imbalanced dialect distribution.
     """
 
-    def __init__(self, regional_model, alpha: float = ALPHA_REGION_LOSS, *args, **kwargs):
+    def __init__(self, regional_model, class_counts=None, alpha: float = ALPHA_REGION_LOSS, *args, **kwargs):
         """
         Initialize the Regional Trainer.
 
         Args:
             regional_model: The RegionalAdapterWhisper model
+            class_counts: List of sample counts per class for weighting [N, S, W, C]
             alpha: Weight for regional classification loss (0-1)
             *args, **kwargs: Arguments passed to Seq2SeqTrainer
         """
         super().__init__(*args, **kwargs)
         self.regional_model = regional_model
-        self.region_criterion = nn.CrossEntropyLoss()
         self.alpha = alpha  # Weight for regional classification loss
+        self.class_counts = class_counts
+
+        # Initialize criterion (will be set with weights on first forward pass)
+        self._region_criterion = None
 
     def _remove_unused_columns(self, dataset, description=None):
         """
@@ -35,6 +63,17 @@ class RegionalTrainer(Seq2SeqTrainer):
         """
         # Don't remove any columns - we need them all!
         return dataset
+
+    def _get_region_criterion(self, device):
+        """Get or create the region criterion with class weights."""
+        if self._region_criterion is None:
+            if self.class_counts is not None:
+                weights = compute_class_weights(self.class_counts, device)
+                print(f"Using class weights: {weights.tolist()}")
+                self._region_criterion = nn.CrossEntropyLoss(weight=weights)
+            else:
+                self._region_criterion = nn.CrossEntropyLoss()
+        return self._region_criterion
 
     def compute_loss(self, model, inputs, return_outputs=False, num_items_in_batch=None):
         """
@@ -60,10 +99,11 @@ class RegionalTrainer(Seq2SeqTrainer):
         # ASR loss (from Whisper decoder)
         asr_loss = outputs["loss"] if outputs["loss"] is not None else torch.tensor(0.0)
 
-        # Regional classification loss
+        # Regional classification loss (with class weighting)
         region_loss = torch.tensor(0.0, device=asr_loss.device)
         if outputs["region_logits"] is not None and "region_labels" in inputs:
-            region_loss = self.region_criterion(
+            criterion = self._get_region_criterion(asr_loss.device)
+            region_loss = criterion(
                 outputs["region_logits"],
                 inputs["region_labels"]
             )
