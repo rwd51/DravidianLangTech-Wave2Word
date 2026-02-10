@@ -57,6 +57,7 @@ from finetune_utils import (
 )
 from dolphin.model import DolphinSpeech2Text
 from dolphin.audio import load_audio
+from tamil_text_normalizer import create_normalizer
 
 # Setup logging
 logging.basicConfig(
@@ -910,6 +911,7 @@ def main():
 
     logger.info(f"Train samples: {len(train_samples)}")
     logger.info(f"Val samples: {len(val_samples)}")
+    logger.info("✓ Text normalization applied during data loading (default preset)")
 
     # Create data loaders
     train_dataset = AudioDataset(train_samples, device=device)

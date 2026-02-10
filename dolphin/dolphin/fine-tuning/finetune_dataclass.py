@@ -24,9 +24,10 @@ from finetune_config import (
 # Add parent directory for imports
 import sys
 
-sys.path.insert(0, str(Path(__file__).parent.parent.parent))
+sys.path.insert(0, str(Path(__file__).parent.parent.parent.parent))
 
 from dolphin.audio import load_audio
+from tamil_text_normalizer import create_normalizer
 
 logger = logging.getLogger(__name__)
 logger.setLevel(logging.INFO)
@@ -36,15 +37,20 @@ if not logger.handlers:
     handler.setFormatter(formatter)
     logger.addHandler(handler)
 
+# Initialize text normalizer
+text_normalizer = create_normalizer(preset="default")
+logger.info("Initialized Tamil text normalizer with 'default' preset")
+
 
 @dataclass
 class AudioSample:
     """Represents a single audio sample or combined samples."""
 
     audio_data: np.ndarray
-    transcription: str
+    transcription: str  # Normalized transcription for training
     original_filenames: List[str]
     duration: float  # in seconds
+    original_transcription: Optional[str] = None  # Raw unnormalized transcription for reference
 
     def get_token_sequence(self) -> str:
         """Get formatted token sequence with special tokens."""
@@ -196,10 +202,15 @@ class AudioDataLoader:
 
                         # Only include audio above minimum duration
                         if duration >= AUDIO_MIN_DURATION:
+                            # Normalize transcription text
+                            raw_transcription = transcriptions[filename]
+                            normalized_transcription = text_normalizer(raw_transcription)
+                            
                             samples.append(
                                 {
                                     "audio": audio_data,
-                                    "transcription": transcriptions[filename],
+                                    "transcription": normalized_transcription,  # Use normalized version for training
+                                    "original_transcription": raw_transcription,  # Keep raw for reference
                                     "filenames": [filename],  # Always use list for consistency
                                     "duration": duration,
                                     "path": str(wav_file),
@@ -362,6 +373,7 @@ class AudioDataLoader:
                 transcription=s["transcription"],
                 original_filenames=s["filenames"],
                 duration=s["duration"],
+                original_transcription=s.get("original_transcription"),
             )
             for s in train_samples_raw
         ]
@@ -372,6 +384,7 @@ class AudioDataLoader:
                 transcription=s["transcription"],
                 original_filenames=s["filenames"],
                 duration=s["duration"],
+                original_transcription=s.get("original_transcription"),
             )
             for s in val_samples_raw
         ]
