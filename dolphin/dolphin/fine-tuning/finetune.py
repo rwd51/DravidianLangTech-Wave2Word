@@ -19,6 +19,8 @@ warnings.filterwarnings("ignore")
 # Setup path
 sys.path.insert(0, str(Path(__file__).parent.parent.parent))
 
+from collections import defaultdict
+
 from finetune_config import (
     DATASET_ROOT,
     PRETRAINED_MODEL_DIR,
@@ -89,6 +91,11 @@ def collate_batch(batch):
     # Find max length in batch
     max_audio_len = max(item["audio"].shape[0] for item in batch)
 
+    # Keep original (unpadded) lengths
+    audio_lengths = torch.tensor(
+        [item["audio"].shape[0] for item in batch], dtype=torch.long
+    )
+
     # Pad all audios to max length
     padded_audios = []
     for item in batch:
@@ -100,6 +107,7 @@ def collate_batch(batch):
 
     return {
         "audios": torch.stack(padded_audios),
+        "audio_lengths": audio_lengths,
         "transcriptions": [item["transcription"] for item in batch],
         "original_transcriptions": [item["original_transcription"] for item in batch],
         "filenames_list": [item["filenames"] for item in batch],
@@ -166,33 +174,6 @@ def load_pretrained_model(model_dir, device):
     return model, train_args, tokenizer, converter
 
 
-def compute_ctc_loss(model, audio, transcription_tokens, train_args, device):
-    """Compute CTC loss for a batch."""
-    # Convert audio to features using preprocessor
-    batch_size = audio.shape[0]
-
-    # Get audio length
-    audio_length = torch.tensor(
-        [audio.shape[1] for _ in range(batch_size)], dtype=torch.long, device=device
-    )
-
-    # Feature extraction
-    with torch.no_grad():
-        feats, feats_length = model.encode(audio, audio_length)
-
-    # Encoder output
-    encoder_out, encoder_out_lens, _ = model.encoder(feats, feats_length)
-
-    # CTC loss computation
-    ys_hat = model.ctc.argmax(encoder_out)
-
-    # For actual CTC loss, we need token indices
-    # This is a simplified version - in practice you'd need proper tokenization
-    ctc_loss = model.criterion_ctc(ys_hat.view(-1), transcription_tokens.view(-1))
-
-    return ctc_loss
-
-
 def eval_step(model, val_dataloader, device, train_args, tokenizer, converter):
     """Validation step."""
     logger.info("Running validation...")
@@ -203,25 +184,37 @@ def eval_step(model, val_dataloader, device, train_args, tokenizer, converter):
     total_wer = 0.0
     num_batches = 0
     num_samples = 0
+    num_loss_batches = 0
+    num_skipped_loss_batches = 0
     transcriptions = []
+    
+    # File-level debugging
+    file_errors = defaultdict(list)  # filename -> list of error messages
+    file_success = set()  # filenames that succeeded
 
     with torch.no_grad():
         pbar = tqdm(val_dataloader, desc="Validation", leave=False)
         for batch in pbar:
             audios = batch["audios"].to(device)
+            audio_lengths = batch.get("audio_lengths")
+            if audio_lengths is not None:
+                audio_lengths = audio_lengths.to(device)
             original_transcriptions = batch["original_transcriptions"]
 
             # Forward pass (simplified - actual implementation needs proper tokenization)
             try:
                 # Get encoder output
-                audio_length = torch.tensor(
-                    [audios.shape[1] for _ in range(audios.shape[0])],
-                    dtype=torch.long,
-                    device=device,
-                )
+                if audio_lengths is None:
+                    audio_length = torch.tensor(
+                        [audios.shape[1] for _ in range(audios.shape[0])],
+                        dtype=torch.long,
+                        device=device,
+                    )
+                else:
+                    audio_length = audio_lengths
 
-                feats, feats_length = model.encode(audios, audio_length)
-                encoder_out, encoder_out_lens, _ = model.encoder(feats, feats_length)
+                # Forward pass through encoder (includes frontend, normalize, and encoder)
+                encoder_out, encoder_out_lens = model.encode(audios, audio_length)
 
                 # Compute CTC loss on validation batch
                 blank_id = int(getattr(model.ctc, "blank_id", 0))
@@ -255,16 +248,67 @@ def eval_step(model, val_dataloader, device, train_args, tokenizer, converter):
                 ctc_log_probs = F.log_softmax(ctc_logits, dim=-1)
                 log_probs_ctc = ctc_log_probs.transpose(0, 1)
 
-                batch_loss = F.ctc_loss(
-                    log_probs_ctc,
-                    targets,
-                    encoder_out_lens,
-                    target_lengths,
-                    blank=blank_id,
-                    reduction="mean",
-                    zero_infinity=True,
-                )
-                total_loss += float(batch_loss.item())
+                input_lengths = encoder_out_lens.detach().cpu().tolist()
+                target_lengths_list = target_lengths.detach().cpu().tolist()
+                valid_indices = [
+                    i
+                    for i, (tlen, ilen) in enumerate(
+                        zip(target_lengths_list, input_lengths)
+                    )
+                    if tlen > 0 and tlen <= ilen
+                ]
+
+                if valid_indices:
+                    targets = targets[valid_indices]
+                    target_lengths = target_lengths[valid_indices]
+                    log_probs_ctc = log_probs_ctc[:, valid_indices, :]
+                    input_lengths = torch.tensor(
+                        [input_lengths[i] for i in valid_indices],
+                        dtype=torch.long,
+                        device=device,
+                    )
+
+                    batch_loss = F.ctc_loss(
+                        log_probs_ctc,
+                        targets,
+                        input_lengths,
+                        target_lengths,
+                        blank=blank_id,
+                        reduction="mean",
+                        zero_infinity=True,
+                    )
+                    total_loss += float(batch_loss.item())
+                    num_loss_batches += 1
+                else:
+                    num_skipped_loss_batches += 1
+
+                if num_batches == 0:
+                    # Debug only for the first validation batch
+                    logger.info(
+                        "[DEBUG][val] input_len(min/avg/max)=%s / %s / %s, target_len(min/avg/max)=%s / %s / %s, valid=%d/%d",
+                        min(input_lengths),
+                        int(sum(input_lengths) / max(len(input_lengths), 1)),
+                        max(input_lengths),
+                        min(target_lengths_list),
+                        int(sum(target_lengths_list) / max(len(target_lengths_list), 1)),
+                        max(target_lengths_list),
+                        len(valid_indices),
+                        len(target_lengths_list),
+                    )
+                    try:
+                        sample_text = original_transcriptions[0]
+                        sample_tokens = tokenizer.text2tokens(sample_text)
+                        logger.info(
+                            "[DEBUG][val] sample text (first 80 chars): %s",
+                            sample_text[:80],
+                        )
+                        logger.info(
+                            "[DEBUG][val] sample token count=%d, first 10 tokens=%s",
+                            len(sample_tokens),
+                            sample_tokens[:10],
+                        )
+                    except Exception as e:
+                        logger.info("[DEBUG][val] tokenization debug failed: %s", e)
 
                 # CTC decoding - get predictions for each sample in batch
                 ctc_probs = model.ctc.log_softmax(encoder_out)
@@ -301,25 +345,81 @@ def eval_step(model, val_dataloader, device, train_args, tokenizer, converter):
                         }
                     )
                     num_samples += 1
+                    
+                    # Track successful files
+                    if isinstance(filenames, list):
+                        for fname in filenames:
+                            file_success.add(fname)
+                    else:
+                        file_success.add(filenames)
 
                 num_batches += 1
                 pbar.update(1)
 
             except Exception as e:
                 logger.warning(f"Error during validation batch: {e}")
+                # Track which files were in this failed batch
+                for filenames in batch["filenames_list"]:
+                    if isinstance(filenames, list):
+                        for fname in filenames:
+                            file_errors[fname].append(str(e))
+                    else:
+                        file_errors[filenames].append(str(e))
                 continue
 
     pbar.close()
-    avg_loss = total_loss / max(num_batches, 1)
+    
+    # Compute average loss from successful batches
+    if num_loss_batches > 0:
+        avg_loss = total_loss / num_loss_batches
+    else:
+        avg_loss = 0.0
+        logger.warning("No valid validation batches for loss computation!")
+    
     logger.info(f"Validation completed: {num_batches} batches processed, {len(transcriptions)} transcriptions generated")
-    logger.info(f"Validation Loss: {avg_loss:.6f}")
+    logger.info(f"Validation Loss: {avg_loss:.6f} (averaged over {num_loss_batches} batches)")
+    logger.info(
+        f"Validation loss batches used: {num_loss_batches}, skipped (no valid idx): {num_skipped_loss_batches}"
+    )
+    
+    # Compute WER
+    total_wer = 0.0
+    num_wer_samples = 0
+    for trans in transcriptions:
+        if trans['predicted'] and not trans['predicted'].startswith('[Decoding error'):
+            wer = compute_wer(trans['original'], trans['predicted'])
+            total_wer += wer
+            num_wer_samples += 1
+    
+    avg_wer = total_wer / max(num_wer_samples, 1)
+    logger.info(f"WER: {avg_wer:.4f} (computed from {num_wer_samples}/{len(transcriptions)} samples)")
+    
     logger.info(f"Sample predictions (first 3):")
     for i, trans in enumerate(transcriptions[:3]):
         logger.info(f"  Sample {i+1}:")
         logger.info(f"    Original: {trans['original'][:100]}...")
         logger.info(f"    Predicted: {trans['predicted'][:100]}...")
+    
+    # Log file-level statistics
+    logger.info(f"\n[FILE DEBUG] Validation file statistics:")
+    logger.info(f"  Successful files: {len(file_success)}")
+    logger.info(f"  Failed files: {len(file_errors)}")
+    
+    # Write error log if there are failures
+    if file_errors:
+        error_log_path = Path(OUTPUT_DIR) / "validation_file_errors.txt"
+        error_log_path.parent.mkdir(parents=True, exist_ok=True)
+        with open(error_log_path, "w", encoding="utf-8") as f:
+            f.write(f"Validation File Errors ({len(file_errors)} files)\n")
+            f.write("=" * 80 + "\n\n")
+            for fname, errors in sorted(file_errors.items()):
+                f.write(f"File: {fname}\n")
+                f.write(f"Errors: {errors}\n")
+                f.write("-" * 80 + "\n")
+        logger.info(f"  Error details written to: {error_log_path}")
+    
     model.train()
-    return avg_loss, transcriptions
+    return avg_loss, transcriptions, avg_wer
 
 
 def train_epoch(
@@ -332,26 +432,43 @@ def train_epoch(
     total_loss = 0.0
     accum_loss = 0.0
     num_batches = 0
+    num_skipped_batches = 0
+    
+    # File-level debugging
+    file_errors = defaultdict(list)  # filename -> list of error messages
+    file_success = set()  # filenames that succeeded
+    batch_file_map = {}  # batch_idx -> filenames
 
     pbar = tqdm(train_dataloader, desc=f"Epoch {epoch + 1}", leave=True)
 
     for batch_idx, batch in enumerate(pbar):
         audios = batch["audios"].to(device)
+        audio_lengths = batch.get("audio_lengths")
+        if audio_lengths is not None:
+            audio_lengths = audio_lengths.to(device)
         original_transcriptions = batch["original_transcriptions"]
+        
+        # Store filenames for this batch (for error tracking)
+        batch_file_map[batch_idx] = batch["filenames_list"]
+
+        # DEBUG: Log FIRST, before anything can fail
+        if batch_idx == 0:
+            logger.info("[DEBUG][train][epoch %d] Starting batch 0, audio shape=%s, batch_size=%d", epoch + 1, audios.shape, len(original_transcriptions))
+            logger.info("[DEBUG][train] Sample 0 text preview: %s", original_transcriptions[0][:80] if original_transcriptions else "EMPTY")
 
         try:
             # Get audio lengths
-            audio_length = torch.tensor(
-                [audios.shape[1] for _ in range(audios.shape[0])],
-                dtype=torch.long,
-                device=device,
-            )
+            if audio_lengths is None:
+                audio_length = torch.tensor(
+                    [audios.shape[1] for _ in range(audios.shape[0])],
+                    dtype=torch.long,
+                    device=device,
+                )
+            else:
+                audio_length = audio_lengths
 
-            # Forward pass through encoder
-            feats, feats_length = model.encode(audios, audio_length)
-
-            # Encoder forward
-            encoder_out, encoder_out_lens, _ = model.encoder(feats, feats_length)
+            # Forward pass through encoder (includes frontend, normalize, and encoder)
+            encoder_out, encoder_out_lens = model.encode(audios, audio_length)
 
             # Prepare target tokens for CTC loss
             target_tokens_list = []
@@ -369,11 +486,18 @@ def train_epoch(
             
             # Pad targets to same length
             max_target_len = max(target_lengths)
-            targets = torch.zeros(len(target_tokens_list), max_target_len, dtype=torch.long, device=device)
+            targets = torch.zeros(
+                len(target_tokens_list),
+                max_target_len,
+                dtype=torch.long,
+                device=device,
+            )
             for i, tokens in enumerate(target_tokens_list):
-                targets[i, :len(tokens)] = tokens
-            
-            target_lengths = torch.tensor(target_lengths, dtype=torch.long, device=device)
+                targets[i, : len(tokens)] = tokens
+
+            target_lengths = torch.tensor(
+                target_lengths, dtype=torch.long, device=device
+            )
             
             # Compute CTC loss
             # encoder_out shape: [B, T, vocab_size]
@@ -384,24 +508,96 @@ def train_epoch(
             
             # CTC loss expects: log_probs (T, B, C), targets (B, S), input_lengths (B), target_lengths (B)
             log_probs_ctc = ctc_log_probs.transpose(0, 1)  # [T, B, vocab_size]
+
+            # Filter out samples where target length exceeds input length
+            input_lengths = encoder_out_lens.detach().cpu().tolist()
+            target_lengths_list = target_lengths.detach().cpu().tolist()
             
+            # DEBUG: Always log first batch stats BEFORE filtering
+            if batch_idx == 0:
+                logger.info(
+                    "[DEBUG][train][epoch %d][BEFORE FILTER] batch_size=%d, input_len(min/avg/max)=%s/%s/%s, target_len(min/avg/max)=%s/%s/%s",
+                    epoch + 1,
+                    len(input_lengths),
+                    min(input_lengths),
+                    int(sum(input_lengths) / len(input_lengths)),
+                    max(input_lengths),
+                    min(target_lengths_list),
+                    int(sum(target_lengths_list) / len(target_lengths_list)),
+                    max(target_lengths_list),
+                )
+                # Show actual pairs for first 3 samples
+                for i in range(min(3, len(input_lengths))):
+                    logger.info(
+                        "[DEBUG][train] sample %d: input_len=%d, target_len=%d, text_preview: %s",
+                        i,
+                        input_lengths[i],
+                        target_lengths_list[i],
+                        original_transcriptions[i][:60] + "...",
+                    )
+            
+            valid_indices = [
+                i
+                for i, (tlen, ilen) in enumerate(
+                    zip(target_lengths_list, input_lengths)
+                )
+                if tlen > 0 and tlen <= ilen
+            ]
+
+            if not valid_indices:
+                if batch_idx < 5:  # Log first 5 skipped batches
+                    logger.warning(
+                        f"[SKIP] batch {batch_idx}: ALL {len(target_lengths_list)} samples have target_len > input_len"
+                    )
+                optimizer.zero_grad()
+                num_skipped_batches += 1
+                continue
+
+            targets = targets[valid_indices]
+            target_lengths = target_lengths[valid_indices]
+            log_probs_ctc = log_probs_ctc[:, valid_indices, :]
+            input_lengths = torch.tensor(
+                [input_lengths[i] for i in valid_indices],
+                dtype=torch.long,
+                device=device,
+            )
+
             loss = F.ctc_loss(
                 log_probs_ctc,
                 targets,
-                encoder_out_lens,
+                input_lengths,
                 target_lengths,
                 blank=blank_id,
                 reduction="mean",
-                zero_infinity=True
+                zero_infinity=True,
             )
 
             # Normalize loss by gradient accumulation steps
             loss = loss / GRADIENT_ACCUMULATION_STEPS
             loss.backward()
 
+            if batch_idx == 0 or (num_batches == 1):  # Log first successful batch
+                # Debug only for the first training batch of the epoch
+                logger.info(
+                    "[DEBUG][train][epoch %d][AFTER FILTER] loss=%.6f, valid=%d/%d (kept %d%% of batch)",
+                    epoch + 1,
+                    float(loss.item() * GRADIENT_ACCUMULATION_STEPS),
+                    len(valid_indices),
+                    len(target_lengths_list),
+                    int(100 * len(valid_indices) / len(target_lengths_list)),
+                )
+
             accum_loss += loss.item()
             total_loss += loss.item()
             num_batches += 1
+            
+            # Track successful files
+            for filenames in batch["filenames_list"]:
+                if isinstance(filenames, list):
+                    for fname in filenames:
+                        file_success.add(fname)
+                else:
+                    file_success.add(filenames)
 
             # Gradient accumulation
             if (batch_idx + 1) % GRADIENT_ACCUMULATION_STEPS == 0:
@@ -416,8 +612,8 @@ def train_epoch(
 
                 # Log metrics
                 current_lr = optimizer.param_groups[0]["lr"]
+                train_loss = metrics.get_train_loss()  # Always compute for progress bar
                 if metrics.step % LOG_INTERVAL == 0:
-                    train_loss = metrics.get_train_loss()
                     log_metrics(metrics.step, train_loss, lr=current_lr)
 
                 pbar.set_postfix(
@@ -425,13 +621,68 @@ def train_epoch(
                 )
 
         except Exception as e:
-            logger.warning(f"Error processing batch {batch_idx}: {e}")
+            error_msg = f"{type(e).__name__}: {e}"
+            if batch_idx < 5:  # Log first 5 errors in detail
+                logger.error(f"[ERROR] Batch {batch_idx} failed: {error_msg}")
+                import traceback
+                logger.error(f"[ERROR] Traceback: {traceback.format_exc()[:500]}")
+            elif batch_idx == 5:
+                logger.warning(f"(Suppressing further error details, {batch_idx} batches failed so far)")
+            
+            # Track which files were in this failed batch
+            for filenames in batch["filenames_list"]:
+                if isinstance(filenames, list):
+                    for fname in filenames:
+                        file_errors[fname].append(error_msg)
+                else:
+                    file_errors[filenames].append(error_msg)
+            
             optimizer.zero_grad()
+            num_skipped_batches += 1
             continue
 
     pbar.close()
-    avg_loss = total_loss / max(num_batches, 1)
-    logger.info(f"Epoch {epoch + 1} - Average Training Loss: {avg_loss:.6f} (computed from {num_batches} batches)")
+    
+    # CRITICAL: Check if ANY batches succeeded
+    if num_batches == 0:
+        logger.error(f"[CRITICAL] Epoch {epoch + 1}: ZERO successful batches out of {len(train_dataloader)}! All {num_skipped_batches} batches failed.")
+        logger.error(f"[CRITICAL] This means either: (1) All exceptions were caught, or (2) All samples filtered out because target_len > input_len")
+        return 0.0
+    
+    avg_loss = total_loss / num_batches
+    logger.info(f"Epoch {epoch + 1} - Average Training Loss: {avg_loss:.6f} (computed from {num_batches} successful batches)")
+    logger.info(
+        f"Epoch {epoch + 1} - Successful: {num_batches}, Skipped/Failed: {num_skipped_batches}, Total: {len(train_dataloader)}"
+    )
+    
+    # Log file-level statistics
+    logger.info(f"\n[FILE DEBUG] Training file statistics for Epoch {epoch + 1}:")
+    logger.info(f"  Successful files: {len(file_success)}")
+    logger.info(f"  Failed files: {len(file_errors)}")
+    
+    # Write error log if there are failures
+    if file_errors:
+        error_log_path = Path(OUTPUT_DIR) / f"training_file_errors_epoch{epoch+1}.txt"
+        error_log_path.parent.mkdir(parents=True, exist_ok=True)
+        with open(error_log_path, "w", encoding="utf-8") as f:
+            f.write(f"Training File Errors - Epoch {epoch + 1} ({len(file_errors)} files)\n")
+            f.write("=" * 80 + "\n\n")
+            for fname, errors in sorted(file_errors.items()):
+                f.write(f"File: {fname}\n")
+                f.write(f"Errors: {errors}\n")
+                f.write("-" * 80 + "\n")
+        logger.info(f"  Error details written to: {error_log_path}")
+    
+    # Write success log
+    if file_success:
+        success_log_path = Path(OUTPUT_DIR) / f"training_file_success_epoch{epoch+1}.txt"
+        with open(success_log_path, "w", encoding="utf-8") as f:
+            f.write(f"Successfully Processed Files - Epoch {epoch + 1} ({len(file_success)} files)\n")
+            f.write("=" * 80 + "\n\n")
+            for fname in sorted(file_success):
+                f.write(f"{fname}\n")
+        logger.info(f"  Success list written to: {success_log_path}")
+    
     return avg_loss
 
 
@@ -485,7 +736,12 @@ def main():
 
     # Setup training
     optimizer, scheduler, total_steps, training_config = setup_training_config(
-        model, train_dataloader, NUM_EPOCHS, WARMUP_STEPS, LEARNING_RATES
+        model,
+        train_dataloader,
+        NUM_EPOCHS,
+        WARMUP_STEPS,
+        LEARNING_RATES,
+        grad_accum_steps=GRADIENT_ACCUMULATION_STEPS,
     )
 
     metrics = TrainingMetrics(log_interval=LOG_INTERVAL)
@@ -515,10 +771,10 @@ def main():
 
         # Validation (every VAL_CHECK_INTERVAL steps or at end of epoch)
         if (epoch + 1) % 1 == 0:  # Validate every epoch
-            val_loss, transcriptions = eval_step(
+            val_loss, transcriptions, wer = eval_step(
                 model, val_dataloader, device, train_args, tokenizer, converter
             )
-            metrics.add_val_metrics(val_loss, 0.0)  # Placeholder WER
+            metrics.add_val_metrics(val_loss, wer)
 
             val_loss_val, wer_val = metrics.get_last_val_metrics()
             log_metrics(metrics.step, train_loss, val_loss=val_loss_val, wer=wer_val)
@@ -529,7 +785,7 @@ def main():
             print(f"{'='*80}")
             print(f"Train Loss: {train_loss:.6f}")
             print(f"Val Loss:   {val_loss_val:.6f}")
-            print(f"WER:        {wer_val:.4f} (placeholder)")
+            print(f"WER:        {wer_val:.4f}")
             print(f"Learning Rate: {optimizer.param_groups[0]['lr']:.2e}")
             print(f"{'='*80}\n")
 
@@ -572,7 +828,7 @@ def main():
 
     # Run final inference on validation set
     logger.info("Running final inference on validation set...")
-    val_loss, transcriptions = eval_step(model, val_dataloader, device, train_args, tokenizer, converter)
+    val_loss, transcriptions, wer = eval_step(model, val_dataloader, device, train_args, tokenizer, converter)
 
     # Write transcriptions to file
     logger.info(

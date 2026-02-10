@@ -32,7 +32,12 @@ def get_linear_schedule_with_warmup(optimizer, num_warmup_steps, num_training_st
 
 
 def setup_training_config(
-    model, train_dataloader, num_epochs, warmup_steps, learning_rate_range
+    model,
+    train_dataloader,
+    num_epochs,
+    warmup_steps,
+    learning_rate_range,
+    grad_accum_steps=1,
 ):
     """
     Setup optimizer, scheduler, and training configuration.
@@ -54,8 +59,10 @@ def setup_training_config(
     # Setup optimizer
     optimizer = torch.optim.AdamW(trainable_params, lr=lr, weight_decay=1e-5)
 
-    # Calculate total training steps
-    num_update_steps_per_epoch = len(train_dataloader)
+    # Calculate total training steps (account for gradient accumulation)
+    num_update_steps_per_epoch = int(
+        math.ceil(len(train_dataloader) / max(1, grad_accum_steps))
+    )
     total_training_steps = int(num_update_steps_per_epoch * num_epochs)
 
     # Setup scheduler

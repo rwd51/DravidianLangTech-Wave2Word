@@ -21,7 +21,7 @@ TARGET_LANGUAGE = "ta"  # Tamil language code
 TARGET_REGION = "ta-IN"  # Tamil India region code
 SAMPLE_RATE = 16000  # Sample rate in Hz
 AUDIO_MIN_DURATION = 0.5  # Minimum audio duration in seconds
-MAX_COMBINED_AUDIO_LENGTH = 28.0  # Maximum combined audio length in seconds
+MAX_COMBINED_AUDIO_LENGTH = 25.0  # Maximum combined audio length in seconds
 
 # Training Configuration
 LEARNING_RATES = [1e-5, 5e-5]  # Learning rate range for schedule
