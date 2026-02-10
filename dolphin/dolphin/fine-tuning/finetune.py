@@ -129,10 +129,23 @@ def load_pretrained_model(model_dir, device):
     with open(config_path) as f:
         config = yaml.safe_load(f)
 
+    # Fix hardcoded stats path - update to use local feats_stats.npz
+    if "normalize_conf" in config and "stats_file" in config["normalize_conf"]:
+        config["normalize_conf"]["stats_file"] = str(feats_stats_path)
+        logger.info(f"Updated stats_file path to: {feats_stats_path}")
+
+        # Write modified config to a temp file for ESPnet to read
+        temp_config_path = model_dir / "config_temp.yaml"
+        with open(temp_config_path, "w") as f:
+            yaml.dump(config, f)
+        config_file_to_use = str(temp_config_path)
+    else:
+        config_file_to_use = str(config_path)
+
     # Build model using ESPnet
     logger.info("Building model from config...")
     model, train_args = S2TTask.build_model_from_file(
-        config_file=str(config_path),
+        config_file=config_file_to_use,
         model_file=str(model_file),
         device=device,
         task_symbol="<asr>",
