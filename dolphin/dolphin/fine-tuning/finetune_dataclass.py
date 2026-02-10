@@ -2,6 +2,8 @@
 
 import os
 import logging
+import pickle
+import hashlib
 from pathlib import Path
 from typing import List, Dict, Tuple, Optional
 import numpy as np
@@ -15,6 +17,8 @@ from finetune_config import (
     MAX_COMBINED_AUDIO_LENGTH,
     VALIDATION_SPLIT,
     format_token_sequence,
+    CACHE_DIR,
+    USE_CACHE,
 )
 
 # Add parent directory for imports
@@ -50,17 +54,81 @@ class AudioSample:
 class AudioDataLoader:
     """Load and preprocess all audio data from dataset root."""
 
-    def __init__(self, dataset_root: str, combine_short_audios: bool = True):
+    def __init__(self, dataset_root: str, combine_short_audios: bool = True, use_cache: bool = USE_CACHE):
         """
         Initialize data loader.
 
         Args:
             dataset_root: Root path to dataset containing audio subfolders and text files
             combine_short_audios: Whether to combine audios shorter than MAX_COMBINED_AUDIO_LENGTH
+            use_cache: Whether to use cached processed audio data
         """
         self.dataset_root = Path(dataset_root)
         self.combine_short_audios = combine_short_audios
+        self.use_cache = use_cache
         self.samples = []
+        self.cache_file = self._get_cache_path()
+
+    def _get_cache_path(self) -> Path:
+        """Generate cache file path based on dataset configuration."""
+        # Create a hash of the configuration to ensure cache invalidation on config changes
+        config_str = f"{self.dataset_root}_{SAMPLE_RATE}_{AUDIO_MIN_DURATION}_{MAX_COMBINED_AUDIO_LENGTH}_{self.combine_short_audios}_{VALIDATION_SPLIT}"
+        config_hash = hashlib.md5(config_str.encode()).hexdigest()[:8]
+        cache_filename = f"audio_cache_{config_hash}.pkl"
+        return Path(CACHE_DIR) / cache_filename
+    
+    def _save_cache(self, train_samples: List[AudioSample], val_samples: List[AudioSample]):
+        """Save processed samples to cache."""
+        try:
+            logger.info(f"Saving processed audio data to cache: {self.cache_file}")
+            cache_data = {
+                'train_samples': train_samples,
+                'val_samples': val_samples,
+                'config': {
+                    'dataset_root': str(self.dataset_root),
+                    'sample_rate': SAMPLE_RATE,
+                    'audio_min_duration': AUDIO_MIN_DURATION,
+                    'max_combined_audio_length': MAX_COMBINED_AUDIO_LENGTH,
+                    'combine_short_audios': self.combine_short_audios,
+                    'validation_split': VALIDATION_SPLIT,
+                }
+            }
+            with open(self.cache_file, 'wb') as f:
+                pickle.dump(cache_data, f, protocol=pickle.HIGHEST_PROTOCOL)
+            logger.info(f"Cache saved successfully ({self.cache_file.stat().st_size / 1024 / 1024:.2f} MB)")
+        except Exception as e:
+            logger.warning(f"Failed to save cache: {e}")
+    
+    def _load_cache(self) -> Tuple[Optional[List[AudioSample]], Optional[List[AudioSample]]]:
+        """Load processed samples from cache if available."""
+        if not self.use_cache:
+            return None, None
+        
+        if not self.cache_file.exists():
+            logger.info("No cache file found, will process audio from scratch")
+            return None, None
+        
+        try:
+            logger.info(f"Loading cached audio data from: {self.cache_file}")
+            with open(self.cache_file, 'rb') as f:
+                cache_data = pickle.load(f)
+            
+            # Verify cache is for the same configuration
+            cached_config = cache_data.get('config', {})
+            if cached_config.get('dataset_root') != str(self.dataset_root):
+                logger.warning("Cache is for different dataset, will reprocess")
+                return None, None
+            
+            train_samples = cache_data['train_samples']
+            val_samples = cache_data['val_samples']
+            
+            logger.info(f"✓ Loaded from cache: {len(train_samples)} train samples, {len(val_samples)} val samples")
+            logger.info(f"Cache file size: {self.cache_file.stat().st_size / 1024 / 1024:.2f} MB")
+            
+            return train_samples, val_samples
+        except Exception as e:
+            logger.warning(f"Failed to load cache: {e}, will reprocess audio")
+            return None, None
 
     def _get_duration(self, audio_data: np.ndarray) -> float:
         """Calculate audio duration in seconds."""
@@ -264,6 +332,14 @@ class AudioDataLoader:
 
     def load(self) -> Tuple[List[AudioSample], List[AudioSample]]:
         """Load and preprocess all data. Returns (train_samples, val_samples)."""
+        # Try to load from cache first
+        train_samples, val_samples = self._load_cache()
+        if train_samples is not None and val_samples is not None:
+            return train_samples, val_samples
+        
+        # Cache miss or disabled - process audio from scratch
+        logger.info("Processing audio data from scratch...")
+        
         # Load all audio files from all subfolders
         all_samples = self._discover_and_load_samples()
 
@@ -299,5 +375,9 @@ class AudioDataLoader:
             )
             for s in val_samples_raw
         ]
+        
+        # Save to cache for future runs
+        if self.use_cache:
+            self._save_cache(train_samples, val_samples)
 
         return train_samples, val_samples

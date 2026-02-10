@@ -42,6 +42,10 @@ VAL_CHECK_INTERVAL = 500  # Validate every N steps
 SAVE_ONLY_LATEST = True  # Save only the latest checkpoint
 CHECKPOINT_DIR = "/kaggle/checkpoints/finetuned"  # Directory to save checkpoints
 
+# Cache Configuration
+CACHE_DIR = "/kaggle/working/audio_cache"  # Directory to cache processed audio data
+USE_CACHE = True  # Whether to use cached audio data (set False to force reprocessing)
+
 # Output Configuration
 TRANSCRIPTION_OUTPUT = "/kaggle/output/transcriptions.txt"  # Output file for transcriptions
 LOG_INTERVAL = 50  # Log metrics every N steps
@@ -61,6 +65,8 @@ SEED = 42
 os.makedirs(OUTPUT_DIR, exist_ok=True)
 os.makedirs(CHECKPOINT_DIR, exist_ok=True)
 os.makedirs(os.path.dirname(TRANSCRIPTION_OUTPUT), exist_ok=True)
+if USE_CACHE:
+    os.makedirs(CACHE_DIR, exist_ok=True)
 
 # Special tokens
 SPECIAL_TOKENS = {
