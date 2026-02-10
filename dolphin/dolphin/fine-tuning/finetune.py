@@ -77,6 +77,18 @@ class AudioDataset(Dataset):
 
     def __getitem__(self, idx):
         sample = self.samples[idx]
+        
+        # Debug: verify samples are unique
+        if idx < 8 and len(self.samples) > 8:
+            # Only log first time during validation (when we have 865 samples)
+            if len(self.samples) == 865 and not hasattr(self, '_debug_logged'):
+                if idx == 0:
+                    self._debug_logged = True
+                    print(f"\n[DEBUG][dataset] First 8 validation sample transcriptions:")
+                    for i in range(min(8, len(self.samples))):
+                        s = self.samples[i]
+                        print(f"  Sample {i}: duration={s.duration:.1f}s, trans_len={len(s.transcription)}, text[:60]='{s.transcription[:60]}'")
+        
         return {
             "audio": torch.from_numpy(sample.audio_data).float(),
             "transcription": sample.get_token_sequence(),
@@ -88,6 +100,35 @@ class AudioDataset(Dataset):
 
 def collate_batch(batch):
     """Custom collate function for variable-length audio."""
+    # Debug: Check if all items in batch are identical
+    if not hasattr(collate_batch, '_debug_logged'):
+        collate_batch._debug_logged = True
+        print(f"\n[DEBUG][collate] First batch:")
+        print(f"  Batch size: {len(batch)}")
+        print(f"  Item types: {type(batch[0])}")
+        
+        # Check audio uniqueness
+        audio_shapes = [item["audio"].shape[0] for item in batch]
+        print(f"  Audio shapes: {audio_shapes}")
+        
+        # Check transcription uniqueness
+        trans_lens = [len(item["original_transcription"]) for item in batch]
+        print(f"  Transcription lengths: {trans_lens}")
+        
+        unique_trans = len(set(item["original_transcription"] for item in batch))
+        print(f"  Unique transcriptions: {unique_trans}/{len(batch)}")
+        
+        if unique_trans == 1:
+            print(f"  ⚠️ WARNING: All batch items have identical transcriptions!")
+            print(f"  First 2 transcriptions:")
+            for i in range(min(2, len(batch))):
+                print(f"    [{i}]: '{batch[i]['original_transcription'][:80]}'")
+        
+        # Check if audio data is identical (only if same length)
+        if len(batch) >= 2 and batch[0]["audio"].shape == batch[1]["audio"].shape:
+            audio_diff = torch.abs(batch[0]["audio"] - batch[1]["audio"]).sum().item()
+            print(f"  Audio diff between item 0 and 1: {audio_diff}")
+    
     # Find max length in batch
     max_audio_len = max(item["audio"].shape[0] for item in batch)
 
@@ -176,6 +217,9 @@ def load_pretrained_model(model_dir, device):
 
 def eval_step(model, val_dataloader, device, train_args, tokenizer, converter):
     """Validation step."""
+    print("\n" + "="*80)
+    print("STARTING VALIDATION")
+    print("="*80)
     logger.info("Running validation...")
     logger.info(f"Processing {len(val_dataloader)} validation batches...")
 
@@ -191,10 +235,21 @@ def eval_step(model, val_dataloader, device, train_args, tokenizer, converter):
     # File-level debugging
     file_errors = defaultdict(list)  # filename -> list of error messages
     file_success = set()  # filenames that succeeded
+    
+    # Prediction statistics for debugging
+    pred_stats = {
+        "empty": 0,
+        "short": 0,
+        "decoding_error": 0,
+        "valid": 0,
+    }
+    
+    # Store first batch predictions for comparison
+    first_batch_pred_tokens = []
 
     with torch.no_grad():
         pbar = tqdm(val_dataloader, desc="Validation", leave=False)
-        for batch in pbar:
+        for batch_idx, batch in enumerate(pbar):
             audios = batch["audios"].to(device)
             audio_lengths = batch.get("audio_lengths")
             if audio_lengths is not None:
@@ -313,11 +368,62 @@ def eval_step(model, val_dataloader, device, train_args, tokenizer, converter):
                 # CTC decoding - get predictions for each sample in batch
                 ctc_probs = model.ctc.log_softmax(encoder_out)
                 
+                # Debug first batch CTC outputs
+                if batch_idx == 0:
+                    print(f"\n[DEBUG][val] ctc_probs shape: {ctc_probs.shape}")
+                    print(f"[DEBUG][val] blank_id: {blank_id}")
+                    print(f"[DEBUG][val] Batch size: {len(original_transcriptions)}")
+                    print(f"[DEBUG][val] Checking if all originals are identical...")
+                    all_same = all(t == original_transcriptions[0] for t in original_transcriptions)
+                    print(f"[DEBUG][val] All originals identical? {all_same}")
+                    if not all_same:
+                        print(f"[DEBUG][val] First 3 original transcription lengths: {[len(t) for t in original_transcriptions[:3]]}")
+                        print(f"[DEBUG][val] Original 0 (first 100): '{original_transcriptions[0][:100]}'")
+                        print(f"[DEBUG][val] Original 1 (first 100): '{original_transcriptions[1][:100]}'")
+                        print(f"[DEBUG][val] Original 2 (first 100): '{original_transcriptions[2][:100]}'")
+                    else:
+                        print(f"[DEBUG][val] ⚠️ WARNING: ALL ORIGINALS ARE IDENTICAL!")
+                    
+                    # Check if audio tensors are different
+                    print(f"[DEBUG][val] Audio tensor shape: {audios.shape}")
+                    if audios.shape[0] >= 2:
+                        diff = torch.abs(audios[0] - audios[1]).sum().item()
+                        print(f"[DEBUG][val] Audio diff between sample 0 and 1: {diff}")
+                        if diff < 0.001:
+                            print(f"[DEBUG][val] ⚠️ WARNING: AUDIO SAMPLES 0 AND 1 ARE NEARLY IDENTICAL!")
+                    
+                    # Check if encoder outputs are different
+                    print(f"[DEBUG][val] encoder_out shape: {encoder_out.shape}")
+                    if encoder_out.shape[0] >= 2:
+                        enc_diff = torch.abs(encoder_out[0] - encoder_out[1]).sum().item()
+                        print(f"[DEBUG][val] Encoder output diff between sample 0 and 1: {enc_diff}")
+                        if enc_diff < 0.001:
+                            print(f"[DEBUG][val] ⚠️ WARNING: ENCODER OUTPUTS 0 AND 1 ARE NEARLY IDENTICAL!")
+                    
+                    # Check if CTC probs are different per sample
+                    if ctc_probs.shape[0] >= 2:
+                        ctc_diff = torch.abs(ctc_probs[0] - ctc_probs[1]).sum().item()
+                        print(f"[DEBUG][val] CTC probs diff between sample 0 and 1: {ctc_diff}")
+                        if ctc_diff < 0.001:
+                            print(f"[DEBUG][val] ⚠️ WARNING: CTC PROBS 0 AND 1 ARE NEARLY IDENTICAL!")
+                    
+                    logger.info(f"[DEBUG][val] ctc_probs shape: {ctc_probs.shape}")
+                    logger.info(f"[DEBUG][val] blank_id: {blank_id}")
+                
                 for i, (filenames, orig_trans) in enumerate(
                     zip(batch["filenames_list"], original_transcriptions)
                 ):
                     # Get CTC predictions for this sample
                     ys_hat = ctc_probs[i].argmax(dim=-1)  # [T]
+                    
+                    # Debug first few predictions
+                    if batch_idx == 0 and i < 2:
+                        print(f"[DEBUG][val] Sample {i} ys_hat shape: {ys_hat.shape}")
+                        print(f"[DEBUG][val] Sample {i} ys_hat (first 20): {ys_hat[:20].cpu().tolist()}")
+                        print(f"[DEBUG][val] Sample {i} ys_hat (last 20): {ys_hat[-20:].cpu().tolist()}")
+                        print(f"[DEBUG][val] Sample {i} unique tokens in ys_hat: {len(set(ys_hat.cpu().tolist()))}")
+                        logger.info(f"[DEBUG][val] Sample {i} ys_hat shape: {ys_hat.shape}")
+                        logger.info(f"[DEBUG][val] Sample {i} ys_hat (first 20): {ys_hat[:20].cpu().tolist()}")
                     
                     # Remove duplicates and blanks (blank token is typically 0)
                     pred_tokens = []
@@ -327,15 +433,55 @@ def eval_step(model, val_dataloader, device, train_args, tokenizer, converter):
                             pred_tokens.append(token)
                         prev_token = token
                     
+                    # Track prediction length statistics
+                    if len(pred_tokens) == 0:
+                        pred_stats["empty"] += 1
+                    elif len(pred_tokens) < 3:
+                        pred_stats["short"] += 1
+                    
+                    # Store first batch predictions for comparison
+                    if batch_idx == 0:
+                        first_batch_pred_tokens.append(pred_tokens.copy())
+                    
                     # Convert token IDs to text
                     try:
                         # Convert IDs to tokens
                         tokens = converter.ids2tokens(pred_tokens)
                         # Join tokens and detokenize
                         pred_text = tokenizer.tokens2text(tokens)
+                        
+                        # Debug first few tokenizations
+                        if batch_idx == 0 and i < 2:
+                            print(f"[DEBUG][val] Sample {i} pred_tokens count: {len(pred_tokens)}")
+                            print(f"[DEBUG][val] Sample {i} pred_tokens (first 20): {pred_tokens[:20]}")
+                            print(f"[DEBUG][val] Sample {i} tokens (first 10): {tokens[:10]}")
+                            print(f"[DEBUG][val] Sample {i} pred_text: '{pred_text}'")
+                            print(f"[DEBUG][val] Sample {i} pred_text length: {len(pred_text)}")
+                            logger.info(f"[DEBUG][val] Sample {i} pred_tokens count: {len(pred_tokens)}")
+                            logger.info(f"[DEBUG][val] Sample {i} tokens (first 10): {tokens[:10]}")
+                            logger.info(f"[DEBUG][val] Sample {i} pred_text: '{pred_text}'")
+                            logger.info(f"[DEBUG][val] Sample {i} pred_text length: {len(pred_text)}")
+                        
+                        if pred_text and pred_text.strip():
+                            pred_stats["valid"] += 1
+                        else:
+                            pred_stats["empty"] += 1
+                            
                     except Exception as e:
                         pred_text = f"[Decoding error: {e}]"
+                        pred_stats["decoding_error"] += 1
                         logger.debug(f"Decoding error: {e}")
+                    
+                    # Debug comparison for first few samples
+                    if batch_idx == 0 and i < 3:
+                        print(f"\n[DEBUG][val] === Sample {i} Comparison ===")
+                        print(f"  Original: '{orig_trans[:100]}'")
+                        print(f"  Predicted: '{pred_text[:100]}'")
+                        print(f"  Original length: {len(orig_trans)}, Predicted length: {len(pred_text)}")
+                        logger.info(f"[DEBUG][val] === Sample {i} Comparison ===")
+                        logger.info(f"  Original: '{orig_trans}'")
+                        logger.info(f"  Predicted: '{pred_text}'")
+                        logger.info(f"  Original length: {len(orig_trans)}, Predicted length: {len(pred_text)}")
                     
                     transcriptions.append(
                         {
@@ -352,6 +498,20 @@ def eval_step(model, val_dataloader, device, train_args, tokenizer, converter):
                             file_success.add(fname)
                     else:
                         file_success.add(filenames)
+
+                # After first batch, check if all predictions are identical
+                if batch_idx == 0 and len(first_batch_pred_tokens) >= 2:
+                    print(f"\n[DEBUG][val] Checking if all predictions in first batch are identical...")
+                    all_pred_same = all(
+                        first_batch_pred_tokens[0] == pred_tok
+                        for pred_tok in first_batch_pred_tokens
+                    )
+                    print(f"[DEBUG][val] All predictions identical? {all_pred_same}")
+                    if all_pred_same:
+                        print(f"[DEBUG][val] ⚠️ WARNING: ALL PREDICTIONS IN FIRST BATCH ARE IDENTICAL!")
+                        print(f"[DEBUG][val] Number of samples in batch: {len(first_batch_pred_tokens)}")
+                    else:
+                        print(f"[DEBUG][val] ✓ Predictions are different across samples (good)")
 
                 num_batches += 1
                 pbar.update(1)
@@ -382,16 +542,58 @@ def eval_step(model, val_dataloader, device, train_args, tokenizer, converter):
         f"Validation loss batches used: {num_loss_batches}, skipped (no valid idx): {num_skipped_loss_batches}"
     )
     
+    # Log prediction statistics
+    print(f"\n" + "="*80)
+    print(f"[DEBUG][val] Prediction Statistics:")
+    print(f"  Valid predictions: {pred_stats['valid']}")
+    print(f"  Empty predictions: {pred_stats['empty']}")
+    print(f"  Short predictions (<3 tokens): {pred_stats['short']}")
+    print(f"  Decoding errors: {pred_stats['decoding_error']}")
+    print(f"  Total: {sum(pred_stats.values())}")
+    print("="*80 + "\n")
+    logger.info(f"\n[DEBUG][val] Prediction Statistics:")
+    logger.info(f"  Valid predictions: {pred_stats['valid']}")
+    logger.info(f"  Empty predictions: {pred_stats['empty']}")
+    logger.info(f"  Short predictions (<3 tokens): {pred_stats['short']}")
+    logger.info(f"  Decoding errors: {pred_stats['decoding_error']}")
+    logger.info(f"  Total: {sum(pred_stats.values())}")
+    
     # Compute WER
     total_wer = 0.0
     num_wer_samples = 0
-    for trans in transcriptions:
+    wer_debug_samples = []
+    
+    for idx, trans in enumerate(transcriptions):
         if trans['predicted'] and not trans['predicted'].startswith('[Decoding error'):
             wer = compute_wer(trans['original'], trans['predicted'])
             total_wer += wer
             num_wer_samples += 1
+            
+            # Collect debug samples for first 5
+            if idx < 5:
+                wer_debug_samples.append({
+                    "original": trans['original'][:80],
+                    "predicted": trans['predicted'][:80],
+                    "wer": wer,
+                })
     
     avg_wer = total_wer / max(num_wer_samples, 1)
+    
+    # Log WER computation debug info
+    print(f"\n[DEBUG][val] WER Computation Details:")
+    for i, sample in enumerate(wer_debug_samples):
+        print(f"  Sample {i}: WER={sample['wer']:.4f}")
+        print(f"    Original: '{sample['original']}'")
+        print(f"    Predicted: '{sample['predicted']}'")
+    print(f"\nWER: {avg_wer:.4f} (computed from {num_wer_samples}/{len(transcriptions)} samples)")
+    print("="*80 + "\n")
+    
+    logger.info(f"\n[DEBUG][val] WER Computation Details:")
+    for i, sample in enumerate(wer_debug_samples):
+        logger.info(f"  Sample {i}: WER={sample['wer']:.4f}")
+        logger.info(f"    Original: '{sample['original']}'")
+        logger.info(f"    Predicted: '{sample['predicted']}'")
+    
     logger.info(f"WER: {avg_wer:.4f} (computed from {num_wer_samples}/{len(transcriptions)} samples)")
     
     logger.info(f"Sample predictions (first 3):")
@@ -702,7 +904,7 @@ def main():
     # Load dataset
     logger.info("Loading dataset...")
     dataset_loader = AudioDataLoader(
-        dataset_root=DATASET_ROOT, combine_short_audios=True
+        dataset_root=DATASET_ROOT, combine_short_audios=False
     )
     train_samples, val_samples = dataset_loader.load()
 

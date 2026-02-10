@@ -200,7 +200,7 @@ class AudioDataLoader:
                                 {
                                     "audio": audio_data,
                                     "transcription": transcriptions[filename],
-                                    "filename": filename,
+                                    "filenames": [filename],  # Always use list for consistency
                                     "duration": duration,
                                     "path": str(wav_file),
                                 }
