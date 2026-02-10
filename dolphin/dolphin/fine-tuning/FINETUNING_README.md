@@ -52,6 +52,8 @@ Before running training, configure the file `finetune_config.py`:
 - `AUDIO_MIN_DURATION`: Minimum audio duration to include (default: 0.5s)
 - `MAX_COMBINED_AUDIO_LENGTH`: Maximum length for combining short audios (default: 28s)
 
+**You might need to open config.yaml from the pretrained model and update the `normalize_conf.stats_file` path to point to the correct location of `feats_stats.npz` in your setup. This is crucial for proper feature normalization during training.**
+
 ### Model Configuration
 
 - `PRETRAINED_MODEL_DIR`: Path to pretrained model assets
