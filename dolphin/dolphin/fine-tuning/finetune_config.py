@@ -9,12 +9,12 @@ from typing import List, Optional
 # Modify these variables to customize the fine-tuning process
 
 # Dataset Configuration
-DATASET_ROOT = "data"  # Root folder containing audio subfolders (e.g., sp1_tha_audio, sp2_tha_audio, etc.)
+DATASET_ROOT = "/kaggle/input/datasets/shadabtanjeed/acl2026-tamildialectclassification-og-2/Train"  # Root folder containing audio subfolders (e.g., sp1_tha_audio, sp2_tha_audio, etc.)
 # The loader will automatically discover and load all audio folders (*_audio) and their corresponding text files
 
 # Pretrained Model Configuration
-PRETRAINED_MODEL_DIR = "dolphin/assets"  # Directory with pretrained model (bpe.model, config.yaml, feats_stats.npz, small.pt)
-OUTPUT_DIR = "output/finetuned_model"  # Where to save the fine-tuned model
+PRETRAINED_MODEL_DIR = "/kaggle/hf-dolphin-small"  # Directory with pretrained model (bpe.model, config.yaml, feats_stats.npz, small.pt)
+OUTPUT_DIR = "/kaggle/dolphin-finetuned-output"  # Where to save the fine-tuned model
 
 # Audio Processing Configuration
 TARGET_LANGUAGE = "ta"  # Tamil language code
@@ -30,7 +30,7 @@ WARMUP_STEPS = 200  # Warmup steps
 CTC_WEIGHT = 0.3  # CTC loss weight
 DROPOUT_RANGE = [0.05, 0.1]  # Dropout range
 NUM_EPOCHS = 4  # Number of training epochs
-BATCH_SIZE = 4  # Batch size
+BATCH_SIZE = 8  # Batch size
 GRADIENT_ACCUMULATION_STEPS = 2  # Gradient accumulation steps
 MAX_GRAD_NORM = 1.0  # Maximum gradient norm for clipping
 
@@ -40,16 +40,16 @@ VAL_CHECK_INTERVAL = 500  # Validate every N steps
 
 # Checkpoint Configuration
 SAVE_ONLY_LATEST = True  # Save only the latest checkpoint
-CHECKPOINT_DIR = "checkpoints/finetuned"  # Directory to save checkpoints
+CHECKPOINT_DIR = "/kaggle/checkpoints/finetuned"  # Directory to save checkpoints
 
 # Output Configuration
-TRANSCRIPTION_OUTPUT = "output/transcriptions.txt"  # Output file for transcriptions
-LOG_INTERVAL = 100  # Log metrics every N steps
+TRANSCRIPTION_OUTPUT = "/kaggle/output/transcriptions.txt"  # Output file for transcriptions
+LOG_INTERVAL = 50  # Log metrics every N steps
 
 # Device Configuration
 DEVICE = "cuda"  # Device to use: 'cuda' or 'cpu'
 DTYPE = "float32"  # Data type: 'float32' or 'float16'
-NUM_WORKERS = 4  # Number of workers for DataLoader
+NUM_WORKERS = 8  # Number of workers for DataLoader
 
 # Random Seed
 SEED = 42
