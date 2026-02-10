@@ -144,12 +144,7 @@ def load_pretrained_model(model_dir, device):
 
     # Build model using ESPnet
     logger.info("Building model from config...")
-    model, train_args = S2TTask.build_model_from_file(
-        config_file=config_file_to_use,
-        model_file=str(model_file),
-        device=device,
-        task_symbol="<asr>",
-    )
+    model, train_args = S2TTask.build_model_from_file(str(config_path), str(model_file))
 
     model.to(device)
     model.train()
