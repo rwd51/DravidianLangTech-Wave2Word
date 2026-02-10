@@ -411,6 +411,10 @@ def main():
 
         logger.info(f"Epoch {epoch + 1}/{NUM_EPOCHS} completed")
 
+    logger.info("=" * 80)
+    logger.info("All training epochs completed")
+    logger.info("=" * 80)
+
     # Save final model
     logger.info("Saving final model...")
     output_path = Path(OUTPUT_DIR)
@@ -418,6 +422,7 @@ def main():
 
     # Save model state
     torch.save(model.state_dict(), output_path / "model.pt")
+    logger.info(f"Model weights saved to {output_path / 'model.pt'}")
 
     # Copy config and assets
     import shutil
@@ -426,14 +431,29 @@ def main():
         src = Path(PRETRAINED_MODEL_DIR) / file
         if src.exists():
             shutil.copy(src, output_path / file)
+            logger.info(f"Copied {file} to {output_path}")
 
     logger.info(f"Model saved to {output_path}")
 
+    # Run final inference on validation set
+    logger.info("Running final inference on validation set...")
+    val_loss, transcriptions = eval_step(model, val_dataloader, device, train_args)
+
     # Write transcriptions to file
-    logger.info(f"Writing transcriptions to {TRANSCRIPTION_OUTPUT}")
+    logger.info(
+        f"Writing {len(transcriptions)} transcriptions to {TRANSCRIPTION_OUTPUT}"
+    )
     with open(TRANSCRIPTION_OUTPUT, "w", encoding="utf-8") as f:
         f.write("filename\toriginal_transcription\tmodel_transcription\n")
         f.write("-" * 100 + "\n")
+        for trans in transcriptions:
+            filenames_str = (
+                ",".join(trans["filenames"])
+                if isinstance(trans["filenames"], list)
+                else trans["filenames"]
+            )
+            f.write(f"{filenames_str}\t{trans['original']}\t{trans['predicted']}\n")
+    logger.info(f"Transcriptions written to {TRANSCRIPTION_OUTPUT}")
 
     logger.info("=" * 80)
     logger.info("TRAINING COMPLETED")
