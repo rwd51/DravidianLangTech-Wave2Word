@@ -41,6 +41,10 @@ def parse_args():
                         help="Batch size for embedding extraction")
     parser.add_argument("--perplexity", type=int, default=30,
                         help="t-SNE perplexity")
+    parser.add_argument("--split", type=str, default="val", choices=["val", "all"],
+                        help="'val' = validation set only (held-out), 'all' = full training data")
+    parser.add_argument("--compare_pretrained", action="store_true",
+                        help="Also generate plot with vanilla pretrained Whisper (no adapter) for side-by-side comparison")
     return parser.parse_args()
 
 
@@ -166,6 +170,81 @@ def extract_embeddings(model, processor, audio_paths, dialects, device, batch_si
     return all_embeddings, all_labels, all_paths
 
 
+def extract_embeddings_pretrained(processor, audio_paths, dialects, device, batch_size=32):
+    """
+    Extract mean-pooled encoder embeddings from vanilla pretrained Whisper (no adapter).
+    Uses mean pooling since the attention pooling head doesn't exist in the base model.
+    """
+    print(f"\nLoading vanilla pretrained Whisper: {MODEL_NAME}")
+    base_whisper = WhisperForConditionalGeneration.from_pretrained(MODEL_NAME)
+    base_whisper = base_whisper.to(device)
+    base_whisper.eval()
+
+    all_embeddings = []
+    all_labels = []
+    all_paths = []
+
+    num_samples = len(audio_paths)
+    print(f"Extracting pretrained embeddings for {num_samples} samples (mean pooling)...")
+
+    for batch_start in range(0, num_samples, batch_size):
+        batch_end = min(batch_start + batch_size, num_samples)
+        batch_audio_paths = audio_paths[batch_start:batch_end]
+        batch_dialects = dialects[batch_start:batch_end]
+
+        batch_features = []
+        valid_indices = []
+
+        for i, audio_path in enumerate(batch_audio_paths):
+            try:
+                audio, sr = librosa.load(audio_path, sr=SAMPLING_RATE)
+                features = processor.feature_extractor(
+                    audio, sampling_rate=SAMPLING_RATE, return_tensors="pt"
+                )
+                batch_features.append(features.input_features.squeeze(0))
+                valid_indices.append(i)
+            except Exception as e:
+                print(f"  Warning: Failed to load {os.path.basename(audio_path)}: {e}")
+
+        if not batch_features:
+            continue
+
+        max_len = max(f.shape[-1] for f in batch_features)
+        padded = []
+        for f in batch_features:
+            if f.shape[-1] < max_len:
+                pad_size = max_len - f.shape[-1]
+                f = torch.nn.functional.pad(f, (0, pad_size))
+            padded.append(f)
+
+        input_features = torch.stack(padded).to(device)
+
+        with torch.no_grad():
+            encoder_outputs = base_whisper.model.encoder(input_features=input_features)
+            hidden_states = encoder_outputs.last_hidden_state
+            # Mean pooling over sequence (no trained attention head available)
+            pooled_output = hidden_states.mean(dim=1)  # [batch, d_model]
+
+        embeddings = pooled_output.cpu().numpy()
+        all_embeddings.append(embeddings)
+
+        for idx in valid_indices:
+            all_labels.append(batch_dialects[idx])
+            all_paths.append(batch_audio_paths[idx])
+
+        processed = min(batch_end, num_samples)
+        if processed % (batch_size * 5) == 0 or processed == num_samples:
+            print(f"  Processed {processed}/{num_samples} samples")
+
+    # Free GPU memory
+    del base_whisper
+    torch.cuda.empty_cache() if torch.cuda.is_available() else None
+
+    all_embeddings = np.concatenate(all_embeddings, axis=0)
+    print(f"  Pretrained embeddings shape: {all_embeddings.shape}")
+    return all_embeddings, all_labels, all_paths
+
+
 def run_tsne(embeddings, perplexity=30, n_iter=1000, learning_rate="auto", seed=42):
     """Run t-SNE dimensionality reduction."""
     print(f"\nRunning t-SNE (perplexity={perplexity}, n_iter={n_iter})...")
@@ -190,7 +269,7 @@ def run_tsne(embeddings, perplexity=30, n_iter=1000, learning_rate="auto", seed=
     return tsne_results
 
 
-def create_tsne_plot(tsne_results, labels, save_path):
+def create_tsne_plot(tsne_results, labels, save_path, split="val"):
     """Create and save the t-SNE visualization."""
     print(f"\nGenerating t-SNE plot...")
 
@@ -215,9 +294,10 @@ def create_tsne_plot(tsne_results, labels, save_path):
             linewidths=0.5,
         )
 
+    split_label = "Validation Set — Unseen Data" if split == "val" else "Full Training Set"
     ax.set_title(
-        "t-SNE of Whisper Encoder Dialect Embeddings (Validation Set)\n"
-        "(Attention-Pooled Encoder Representations — Unseen Data)",
+        f"t-SNE of Whisper Encoder Dialect Embeddings ({split_label})\n"
+        "(Attention-Pooled Encoder Representations)",
         fontsize=14,
         fontweight="bold",
         pad=15,
@@ -239,6 +319,54 @@ def create_tsne_plot(tsne_results, labels, save_path):
     fig.savefig(save_path, dpi=200, bbox_inches="tight", facecolor="white")
     plt.close(fig)
     print(f"  Plot saved to: {save_path}")
+
+
+def create_comparison_plot(tsne_pretrained, tsne_trained, labels, save_path, split="val"):
+    """Create side-by-side t-SNE: pretrained vs trained."""
+    print(f"\nGenerating side-by-side comparison plot...")
+
+    fig, (ax1, ax2) = plt.subplots(1, 2, figsize=(24, 10))
+
+    split_label = "Validation Set" if split == "val" else "Full Training Set"
+    unique_dialects = sorted(set(labels))
+
+    for ax, tsne_results, title in [
+        (ax1, tsne_pretrained, f"Pretrained Whisper (Before Training)\n{split_label} — Mean Pooled"),
+        (ax2, tsne_trained, f"Trained Regional Adapter (After Training)\n{split_label} — Attention Pooled"),
+    ]:
+        for dialect in unique_dialects:
+            mask = np.array([l == dialect for l in labels])
+            display_name = dialect.replace("_", " ")
+            count = mask.sum()
+
+            ax.scatter(
+                tsne_results[mask, 0],
+                tsne_results[mask, 1],
+                c=DIALECT_COLORS.get(dialect, "#999999"),
+                marker=DIALECT_MARKERS.get(dialect, "o"),
+                label=f"{display_name} (n={count})",
+                alpha=0.65,
+                s=50,
+                edgecolors="white",
+                linewidths=0.5,
+            )
+
+        ax.set_title(title, fontsize=13, fontweight="bold", pad=12)
+        ax.set_xlabel("t-SNE Dimension 1", fontsize=11)
+        ax.set_ylabel("t-SNE Dimension 2", fontsize=11)
+        ax.legend(fontsize=10, loc="best", framealpha=0.9, edgecolor="gray", markerscale=1.2)
+        ax.grid(True, alpha=0.2, linestyle="--")
+        ax.set_axisbelow(True)
+
+    fig.suptitle(
+        "Effect of Regional Adapter Training on Dialect Embedding Clustering",
+        fontsize=15, fontweight="bold", y=1.02,
+    )
+    plt.tight_layout()
+    os.makedirs(os.path.dirname(save_path) if os.path.dirname(save_path) else ".", exist_ok=True)
+    fig.savefig(save_path, dpi=200, bbox_inches="tight", facecolor="white")
+    plt.close(fig)
+    print(f"  Comparison plot saved to: {save_path}")
 
 
 def main():
@@ -273,13 +401,17 @@ def main():
     )
     step_start = log_time("Data loading", step_start)
 
-    # Recreate the exact same train/val split used during training (seed=42)
-    print("\nRecreating train/val split with seed=42 (same as training)...")
-    (_, _, _,
-     audio_paths, transcriptions, dialects) = create_train_val_split(
-        all_audio, all_trans, all_dialects
-    )
-    print(f"\nUsing VALIDATION set ({len(audio_paths)} samples) for t-SNE — held-out data")
+    if args.split == "val":
+        # Recreate the exact same train/val split used during training (seed=42)
+        print("\nRecreating train/val split with seed=42 (same as training)...")
+        (_, _, _,
+         audio_paths, transcriptions, dialects) = create_train_val_split(
+            all_audio, all_trans, all_dialects
+        )
+        print(f"\nUsing VALIDATION set ({len(audio_paths)} samples) for t-SNE — held-out data")
+    else:
+        audio_paths, transcriptions, dialects = all_audio, all_trans, all_dialects
+        print(f"\nUsing FULL training set ({len(audio_paths)} samples) for t-SNE")
 
     # ---- Optional subsetting ----
     if args.max_per_dialect is not None:
@@ -309,46 +441,71 @@ def main():
     for dialect, count in sorted(dist.items()):
         print(f"  {dialect}: {count}")
 
-    # ---- Extract embeddings ----
+    # ---- Extract pretrained embeddings (if comparison mode) ----
+    if args.compare_pretrained:
+        print("\n" + "-" * 50)
+        print(">>> PRETRAINED (vanilla Whisper — no adapter)")
+        pretrained_embeddings, _, _ = extract_embeddings_pretrained(
+            processor, audio_paths, dialects, device, batch_size=args.batch_size
+        )
+        step_start = log_time("Pretrained embedding extraction", step_start)
+
+    # ---- Extract trained embeddings ----
     print("\n" + "-" * 50)
+    print(">>> TRAINED (Regional Adapter)")
     embeddings, labels, paths = extract_embeddings(
         model, processor, audio_paths, dialects, device,
         batch_size=args.batch_size
     )
-    step_start = log_time("Embedding extraction", step_start)
+    step_start = log_time("Trained embedding extraction", step_start)
 
     # ---- Save raw embeddings ----
     os.makedirs(args.output_dir, exist_ok=True)
-    np.savez_compressed(
-        embeddings_save_path,
-        embeddings=embeddings,
-        labels=np.array(labels),
-        paths=np.array(paths),
-    )
+    save_dict = dict(embeddings=embeddings, labels=np.array(labels), paths=np.array(paths))
+    if args.compare_pretrained:
+        save_dict["pretrained_embeddings"] = pretrained_embeddings
+    np.savez_compressed(embeddings_save_path, **save_dict)
     print(f"  Embeddings saved to: {embeddings_save_path}")
 
     # ---- Run t-SNE ----
     print("\n" + "-" * 50)
-    tsne_results = run_tsne(
+    tsne_trained = run_tsne(
         embeddings,
         perplexity=args.perplexity,
         n_iter=TSNE_N_ITER,
         learning_rate=TSNE_LEARNING_RATE,
         seed=SEED,
     )
-    step_start = log_time("t-SNE computation", step_start)
+    step_start = log_time("t-SNE computation (trained)", step_start)
 
-    # ---- Generate plot ----
+    if args.compare_pretrained:
+        tsne_pretrained = run_tsne(
+            pretrained_embeddings,
+            perplexity=args.perplexity,
+            n_iter=TSNE_N_ITER,
+            learning_rate=TSNE_LEARNING_RATE,
+            seed=SEED,
+        )
+        step_start = log_time("t-SNE computation (pretrained)", step_start)
+
+    # ---- Generate plots ----
     print("\n" + "-" * 50)
-    create_tsne_plot(tsne_results, labels, plot_save_path)
-    step_start = log_time("Plot generation", step_start)
+    create_tsne_plot(tsne_trained, labels, plot_save_path, split=args.split)
+    step_start = log_time("Plot generation (trained)", step_start)
+
+    if args.compare_pretrained:
+        comparison_path = os.path.join(args.output_dir, "tsne_comparison_pretrained_vs_trained.png")
+        create_comparison_plot(tsne_pretrained, tsne_trained, labels, comparison_path, split=args.split)
+        step_start = log_time("Plot generation (comparison)", step_start)
 
     # ---- Summary ----
     print("\n" + "=" * 70)
     log_time("TOTAL t-SNE pipeline", total_start)
     print(f"  Samples visualized: {len(labels)}")
     print(f"  Embedding dim: {embeddings.shape[1]}")
-    print(f"  Plot: {plot_save_path}")
+    print(f"  Trained plot: {plot_save_path}")
+    if args.compare_pretrained:
+        print(f"  Comparison plot: {comparison_path}")
     print(f"  Embeddings: {embeddings_save_path}")
     print("=" * 70)
 
