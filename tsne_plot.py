@@ -23,7 +23,7 @@ from config import (
     LABEL_TO_DIALECT, SAMPLING_RATE, OUTPUT_DIR, SEED, NUM_REGIONS, ADAPTER_DIM
 )
 from model import RegionalAdapterWhisper
-from data_loader import load_dialect_data
+from data_loader import load_dialect_data, create_train_val_split
 from tamil_text_normalizer import create_normalizer
 
 
@@ -216,8 +216,8 @@ def create_tsne_plot(tsne_results, labels, save_path):
         )
 
     ax.set_title(
-        "t-SNE of Whisper Encoder Dialect Embeddings\n"
-        "(Attention-Pooled Encoder Representations)",
+        "t-SNE of Whisper Encoder Dialect Embeddings (Validation Set)\n"
+        "(Attention-Pooled Encoder Representations — Unseen Data)",
         fontsize=14,
         fontweight="bold",
         pad=15,
@@ -268,13 +268,21 @@ def main():
     model, processor = load_model(adapter_path, device)
     step_start = log_time("Model loading", step_start)
 
-    # ---- Load dataset ----
+    # ---- Load dataset & recreate val split (same seed=42 as training) ----
     print("\n" + "-" * 50)
     normalizer = create_normalizer("default")
-    audio_paths, transcriptions, dialects = load_dialect_data(
+    all_audio, all_trans, all_dialects = load_dialect_data(
         args.train_dir, DIALECT_DIRS, normalizer
     )
     step_start = log_time("Data loading", step_start)
+
+    # Recreate the exact same train/val split used during training (seed=42)
+    print("\nRecreating train/val split with seed=42 (same as training)...")
+    (_, _, _,
+     audio_paths, transcriptions, dialects) = create_train_val_split(
+        all_audio, all_trans, all_dialects
+    )
+    print(f"\nUsing VALIDATION set ({len(audio_paths)} samples) for t-SNE — held-out data")
 
     # ---- Optional subsetting ----
     if args.max_per_dialect is not None:
@@ -300,7 +308,7 @@ def main():
     # Print dialect distribution
     from collections import Counter
     dist = Counter(dialects)
-    print("\nDialect distribution:")
+    print("\nDialect distribution (validation set):")
     for dialect, count in sorted(dist.items()):
         print(f"  {dialect}: {count}")
 
