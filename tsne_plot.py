@@ -8,6 +8,7 @@ to visualize regional clustering in the learned embedding space.
 import os
 import time
 import json
+import argparse
 import torch
 import numpy as np
 import librosa
@@ -26,27 +27,26 @@ from data_loader import load_dialect_data
 from tamil_text_normalizer import create_normalizer
 
 
-# =============================================================================
-# Configuration
-# =============================================================================
-# Path to trained adapter weights (adjust if running locally vs Kaggle)
-ADAPTER_PATH = os.path.join(OUTPUT_DIR, "regional_adapter")
+def parse_args():
+    parser = argparse.ArgumentParser(description="t-SNE visualization of dialect embeddings")
+    parser.add_argument("--train_dir", type=str, default=TRAIN_DIR,
+                        help="Path to training data directory")
+    parser.add_argument("--model_dir", type=str, default=OUTPUT_DIR,
+                        help="Path to saved model directory (contains regional_adapter/)")
+    parser.add_argument("--output_dir", type=str, default="/kaggle/working",
+                        help="Directory to save plot and embeddings")
+    parser.add_argument("--max_per_dialect", type=int, default=None,
+                        help="Max samples per dialect (None = use all)")
+    parser.add_argument("--batch_size", type=int, default=32,
+                        help="Batch size for embedding extraction")
+    parser.add_argument("--perplexity", type=int, default=30,
+                        help="t-SNE perplexity")
+    return parser.parse_args()
 
-# t-SNE hyperparameters
-TSNE_PERPLEXITY = 30
+
+# t-SNE hyperparameters (defaults, overridden by args)
 TSNE_N_ITER = 1000
 TSNE_LEARNING_RATE = "auto"
-
-# Subset config — set MAX_SAMPLES_PER_DIALECT=None to use all data
-# ~9.22h dataset is small enough for full processing on H100
-MAX_SAMPLES_PER_DIALECT = None  # None = use all, or set e.g. 300
-
-# Output
-PLOT_SAVE_PATH = os.path.join(OUTPUT_DIR, "tsne_dialect_embeddings.png")
-EMBEDDINGS_SAVE_PATH = os.path.join(OUTPUT_DIR, "dialect_embeddings.npz")
-
-# Batch size for embedding extraction (H100 can handle large batches)
-EMBED_BATCH_SIZE = 32
 
 # Dialect colors and markers
 DIALECT_COLORS = {
@@ -242,10 +242,19 @@ def create_tsne_plot(tsne_results, labels, save_path):
 
 
 def main():
+    args = parse_args()
+
+    adapter_path = os.path.join(args.model_dir, "regional_adapter")
+    plot_save_path = os.path.join(args.output_dir, "tsne_dialect_embeddings.png")
+    embeddings_save_path = os.path.join(args.output_dir, "dialect_embeddings.npz")
+
     total_start = time.time()
     print("=" * 70)
     print("  t-SNE Visualization of Regional Dialect Embeddings")
     print("=" * 70)
+    print(f"\n  Train dir:  {args.train_dir}")
+    print(f"  Model dir:  {args.model_dir}")
+    print(f"  Output dir: {args.output_dir}")
 
     # ---- Device setup ----
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
@@ -256,20 +265,20 @@ def main():
 
     # ---- Load model ----
     step_start = time.time()
-    model, processor = load_model(ADAPTER_PATH, device)
+    model, processor = load_model(adapter_path, device)
     step_start = log_time("Model loading", step_start)
 
     # ---- Load dataset ----
     print("\n" + "-" * 50)
     normalizer = create_normalizer("default")
     audio_paths, transcriptions, dialects = load_dialect_data(
-        TRAIN_DIR, DIALECT_DIRS, normalizer
+        args.train_dir, DIALECT_DIRS, normalizer
     )
     step_start = log_time("Data loading", step_start)
 
     # ---- Optional subsetting ----
-    if MAX_SAMPLES_PER_DIALECT is not None:
-        print(f"\nSubsetting to max {MAX_SAMPLES_PER_DIALECT} samples per dialect...")
+    if args.max_per_dialect is not None:
+        print(f"\nSubsetting to max {args.max_per_dialect} samples per dialect...")
         from collections import defaultdict
         dialect_indices = defaultdict(list)
         for i, d in enumerate(dialects):
@@ -278,8 +287,8 @@ def main():
         selected_indices = []
         rng = np.random.RandomState(SEED)
         for dialect, indices in dialect_indices.items():
-            if len(indices) > MAX_SAMPLES_PER_DIALECT:
-                indices = rng.choice(indices, MAX_SAMPLES_PER_DIALECT, replace=False).tolist()
+            if len(indices) > args.max_per_dialect:
+                indices = rng.choice(indices, args.max_per_dialect, replace=False).tolist()
             selected_indices.extend(indices)
         selected_indices.sort()
 
@@ -299,25 +308,25 @@ def main():
     print("\n" + "-" * 50)
     embeddings, labels, paths = extract_embeddings(
         model, processor, audio_paths, dialects, device,
-        batch_size=EMBED_BATCH_SIZE
+        batch_size=args.batch_size
     )
     step_start = log_time("Embedding extraction", step_start)
 
     # ---- Save raw embeddings ----
-    os.makedirs(os.path.dirname(EMBEDDINGS_SAVE_PATH), exist_ok=True)
+    os.makedirs(args.output_dir, exist_ok=True)
     np.savez_compressed(
-        EMBEDDINGS_SAVE_PATH,
+        embeddings_save_path,
         embeddings=embeddings,
         labels=np.array(labels),
         paths=np.array(paths),
     )
-    print(f"  Embeddings saved to: {EMBEDDINGS_SAVE_PATH}")
+    print(f"  Embeddings saved to: {embeddings_save_path}")
 
     # ---- Run t-SNE ----
     print("\n" + "-" * 50)
     tsne_results = run_tsne(
         embeddings,
-        perplexity=TSNE_PERPLEXITY,
+        perplexity=args.perplexity,
         n_iter=TSNE_N_ITER,
         learning_rate=TSNE_LEARNING_RATE,
         seed=SEED,
@@ -326,7 +335,7 @@ def main():
 
     # ---- Generate plot ----
     print("\n" + "-" * 50)
-    create_tsne_plot(tsne_results, labels, PLOT_SAVE_PATH)
+    create_tsne_plot(tsne_results, labels, plot_save_path)
     step_start = log_time("Plot generation", step_start)
 
     # ---- Summary ----
@@ -334,8 +343,8 @@ def main():
     log_time("TOTAL t-SNE pipeline", total_start)
     print(f"  Samples visualized: {len(labels)}")
     print(f"  Embedding dim: {embeddings.shape[1]}")
-    print(f"  Plot: {PLOT_SAVE_PATH}")
-    print(f"  Embeddings: {EMBEDDINGS_SAVE_PATH}")
+    print(f"  Plot: {plot_save_path}")
+    print(f"  Embeddings: {embeddings_save_path}")
     print("=" * 70)
 
 
